@@ -1,0 +1,15 @@
+[package]
+name = "monero-fast-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]   # ← erzeugt .a Datei
+
+[dependencies]
+curve25519-dalek = { version = "4", features = ["alloc"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true

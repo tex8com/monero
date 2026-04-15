@@ -125,13 +125,13 @@
 
 #define CRYPTONOTE_MAX_FRAGMENTS                        20 // ~20 * NOISE_BYTES max payload size for covert/noise send
 
-#define COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT     1000
-#define COMMAND_RPC_GET_BLOCKS_FAST_MAX_TX_COUNT        20000
+#define COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT     10000   // was: 1000
+#define COMMAND_RPC_GET_BLOCKS_FAST_MAX_TX_COUNT        200000  // was: 20000
 #define DEFAULT_RPC_MAX_CONNECTIONS_PER_PUBLIC_IP       3
 #define DEFAULT_RPC_MAX_CONNECTIONS_PER_PRIVATE_IP      25
 #define DEFAULT_RPC_MAX_CONNECTIONS                     100
 #define DEFAULT_RPC_SOFT_LIMIT_SIZE                     25 * 1024 * 1024 // 25 MiB
-#define MAX_RPC_CONTENT_LENGTH                          1048576 // 1 MB
+#define MAX_RPC_CONTENT_LENGTH                          20971520 // 20 MB (was: 1 MB)
 
 #define P2P_LOCAL_WHITE_PEERLIST_LIMIT                  1000
 #define P2P_LOCAL_GRAY_PEERLIST_LIMIT                   5000
