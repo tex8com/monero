@@ -45,6 +45,10 @@
 
 #include "cryptonote_config.h"
 
+extern "C" {
+  int fast_generate_key_derivation(uint8_t *result, const uint8_t *scalar, const uint8_t *point);
+}
+
 namespace {
   static void local_abort(const char *msg)
   {
@@ -188,18 +192,12 @@ namespace crypto {
   }
 
   bool crypto_ops::generate_key_derivation(const public_key &key1, const secret_key &key2, key_derivation &derivation) {
-    ge_p3 point;
-    ge_p2 point2;
-    ge_p1p1 point3;
-    assert(sc_check(&key2) == 0);
-    if (ge_frombytes_vartime(&point, &key1) != 0) {
-      return false;
-    }
-    ge_scalarmult(&point2, &unwrap(key2), &point);
-    ge_mul8(&point3, &point2);
-    ge_p1p1_to_p2(&point2, &point3);
-    ge_tobytes(&derivation, &point2);
-    return true;
+    // Fast path: entire key derivation (scalarmult + cofactor x8) in Rust/dalek
+    // No compress→decompress round-trip, everything stays in Rust
+    return fast_generate_key_derivation(
+        reinterpret_cast<uint8_t*>(&derivation),
+        reinterpret_cast<const uint8_t*>(&unwrap(key2)),
+        reinterpret_cast<const uint8_t*>(&key1)) == 0;
   }
 
   void crypto_ops::derivation_to_scalar(const key_derivation &derivation, size_t output_index, ec_scalar &res) {

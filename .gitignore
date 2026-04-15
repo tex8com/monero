@@ -120,3 +120,4 @@ nbproject
 __pycache__/
 *.pyc
 *.log
+.github/

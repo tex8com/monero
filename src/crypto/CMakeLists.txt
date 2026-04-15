@@ -66,12 +66,16 @@ monero_add_library(cncrypto
   ${crypto_sources}
   ${crypto_headers}
   ${crypto_private_headers})
+# curve25519-dalek fast crypto (Rust static library)
+set(FAST_CRYPTO_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../external/monero-fast-crypto/target/release/libmonero_fast_crypto.a")
+
 target_link_libraries(cncrypto
   PUBLIC
     epee
     randomx
     ${Boost_SYSTEM_LIBRARY}
     ${SODIUM_LIBRARY}
+    ${FAST_CRYPTO_LIB}
   PRIVATE
     ${EXTRA_LIBRARIES})
 
