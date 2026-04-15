@@ -26,11 +26,42 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-#if defined(HAVE_HIDAPI) 
+#if defined(HAVE_HIDAPI)
 
 #include <boost/scope_exit.hpp>
 #include "log.hpp"
 #include "device_io_hid.hpp"
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+// macOS 26+ requires HID calls from the main thread due to PAC enforcement.
+// This wrapper dispatches hid_enumerate to the main queue synchronously.
+static hid_device_info* safe_hid_enumerate(unsigned short vid, unsigned short pid) {
+    __block hid_device_info* result = nullptr;
+    if (pthread_main_np()) {
+        result = hid_enumerate(vid, pid);
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = hid_enumerate(vid, pid);
+        });
+    }
+    return result;
+}
+static hid_device* safe_hid_open_path(const char* path) {
+    __block hid_device* result = nullptr;
+    if (pthread_main_np()) {
+        result = hid_open_path(path);
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = hid_open_path(path);
+        });
+    }
+    return result;
+}
+#else
+#define safe_hid_enumerate hid_enumerate
+#define safe_hid_open_path hid_open_path
+#endif
 
 namespace hw {
   namespace io {
@@ -154,14 +185,14 @@ namespace hw {
 
       this->disconnect();
 
-      hwdev_info_list = hid_enumerate(vid, pid);
+      hwdev_info_list = safe_hid_enumerate(vid, pid);
       if (!hwdev_info_list) {
         MDEBUG("Unable to enumerate device "+std::to_string(vid)+":"+std::to_string(vid)+  ": "+ safe_hid_error(this->usb_device));
         return NULL;
       }
       hwdev = NULL;
       if (hid_device_info *device = find_device(hwdev_info_list, interface_number, usage_page)) {
-        hwdev = hid_open_path(device->path);
+        hwdev = safe_hid_open_path(device->path);
       }
       hid_free_enumeration(hwdev_info_list);
       ASSERT_X(hwdev, "Unable to open device "+std::to_string(pid)+":"+std::to_string(vid));
