@@ -29,6 +29,7 @@
 #include <boost/utility/string_ref.hpp>
 #include <chrono>
 #include <string>
+#include <zlib.h>
 #include "byte_slice.h"
 #include "portable_storage_template_helper.h"
 #include "net/http_base.h"
@@ -98,12 +99,44 @@ namespace epee
         return false;
       }
 
+      // Decompress gzip response if server sent Content-Encoding: gzip
+      std::string decompressed_body;
+      const std::string* body_ptr = &pri->m_body;
+      if (pri->m_header_info.m_content_encoding.find("gzip") != std::string::npos)
+      {
+        z_stream zs{};
+        if (inflateInit2(&zs, 15 + 16) != Z_OK) // 15+16 = gzip format
+        {
+          LOG_PRINT_L1("Failed to init gzip decompression");
+          return false;
+        }
+        zs.next_in = (Bytef*)pri->m_body.data();
+        zs.avail_in = pri->m_body.size();
+        decompressed_body.resize(pri->m_body.size() * 4); // estimate 4x ratio
+        int ret;
+        do {
+          zs.next_out = (Bytef*)decompressed_body.data() + zs.total_out;
+          zs.avail_out = decompressed_body.size() - zs.total_out;
+          ret = inflate(&zs, Z_NO_FLUSH);
+          if (ret == Z_BUF_ERROR || (ret == Z_OK && zs.avail_out == 0))
+            decompressed_body.resize(decompressed_body.size() * 2);
+        } while (ret == Z_OK || ret == Z_BUF_ERROR);
+        decompressed_body.resize(zs.total_out);
+        inflateEnd(&zs);
+        if (ret != Z_STREAM_END)
+        {
+          LOG_PRINT_L1("gzip decompression failed: " << ret);
+          return false;
+        }
+        body_ptr = &decompressed_body;
+      }
+
       static const constexpr epee::serialization::portable_storage::limits_t default_http_bin_limits = {
         65536 * 3, // objects
         65536 * 3, // fields
         65536 * 3, // strings
       };
-      return serialization::load_t_from_binary(result_struct, epee::strspan<uint8_t>(pri->m_body), &default_http_bin_limits);
+      return serialization::load_t_from_binary(result_struct, epee::strspan<uint8_t>(*body_ptr), &default_http_bin_limits);
     }
 
     template<class t_request, class t_response, class t_transport>
