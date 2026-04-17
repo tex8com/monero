@@ -250,6 +250,7 @@ namespace net_utils
 				req_buff.append(method.data(), method.size()).append(" ").append(uri.data(), uri.size()).append(" HTTP/1.1\r\n");
 				add_field(req_buff, "Host", m_host_buff);
 				add_field(req_buff, "Content-Length", std::to_string(body.size()));
+				add_field(req_buff, "Accept-Encoding", "gzip");
 
 				//handle "additional_params"
 				for(const auto& field : additional_params)
@@ -752,9 +753,8 @@ namespace net_utils
 				boost::smatch result;						//   12      3
 				if(boost::regex_search( m_response_info.m_header_info.m_content_encoding, result, rexp_match_gzip, boost::match_default) && result[0].matched)
 				{
-          m_pcontent_encoding_handler.reset(new do_nothing_sub_handler(this));
-          LOG_ERROR("GZIP encoding not supported");
-          return false;
+					// Accept gzip: store raw compressed bytes, decompress later in invoke_http_bin
+					m_pcontent_encoding_handler.reset(new do_nothing_sub_handler(this));
 				}
 				else 
 				{
