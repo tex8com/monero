@@ -1191,7 +1191,8 @@ void wallet_device_callback::on_progress(const hw::device_progress& event)
 }
 
 wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended, std::unique_ptr<epee::net_utils::http::http_client_factory> http_client_factory):
-  m_http_client(http_client_factory->create()),
+  m_http_client_factory(std::move(http_client_factory)),
+  m_http_client(m_http_client_factory->create()),
   m_upper_transaction_weight_limit(0),
   m_run(true),
   m_callback(0),
@@ -1406,6 +1407,20 @@ bool wallet2::set_daemon(std::string daemon_address, boost::optional<epee::net_u
 
   const std::string address = get_daemon_address();
   MINFO("setting daemon to " << address);
+
+  // init parallel fetch clients before moving ssl_options
+  m_pull_clients.clear();
+  if (m_http_client_factory)
+  {
+    for (size_t i = 0; i < PARALLEL_FETCH_COUNT; ++i)
+    {
+      auto client = m_http_client_factory->create();
+      auto ssl_copy = ssl_options;
+      client->set_server(address, get_daemon_login(), std::move(ssl_copy));
+      m_pull_clients.push_back(std::move(client));
+    }
+  }
+
   bool ret =  m_http_client->set_server(address, get_daemon_login(), std::move(ssl_options));
   if (ret)
   {
@@ -3231,6 +3246,28 @@ void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_heigh
 
 }
 //----------------------------------------------------------------------------------------------------
+bool wallet2::pull_blocks_extra(
+    epee::net_utils::http::abstract_http_client &client,
+    uint64_t start_height,
+    std::vector<cryptonote::block_complete_entry> &blocks,
+    std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices)
+{
+  cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::request req = AUTO_VAL_INIT(req);
+  cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::response res = AUTO_VAL_INIT(res);
+  req.prune = true;
+  req.start_height = start_height;
+  req.no_miner_tx = m_refresh_type == RefreshNoCoinbase;
+  req.requested_info = COMMAND_RPC_GET_BLOCKS_FAST::BLOCKS_ONLY;
+
+  bool r = net_utils::invoke_http_bin("/getblocks.bin", req, res, client, rpc_timeout);
+  if (!r || res.status != CORE_RPC_STATUS_OK || res.blocks.empty() || res.blocks.size() != res.output_indices.size())
+    return false;
+
+  blocks = std::move(res.blocks);
+  o_indices = std::move(res.output_indices);
+  return true;
+}
+//----------------------------------------------------------------------------------------------------
 void wallet2::pull_hashes(uint64_t start_height, uint64_t &blocks_start_height, const std::list<crypto::hash> &short_chain_history, std::vector<crypto::hash> &hashes)
 {
   cryptonote::COMMAND_RPC_GET_HASHES_FAST::request req = AUTO_VAL_INIT(req);
@@ -3502,6 +3539,43 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
     uint64_t current_height;
     pull_blocks(first, try_incremental, start_height, blocks_start_height, short_chain_history, blocks, o_indices, current_height);
     THROW_WALLET_EXCEPTION_IF(blocks.size() != o_indices.size(), error::wallet_internal_error, "Mismatched sizes of blocks and o_indices");
+
+    // parallel prefetch of subsequent batches using dedicated connections
+    if (!blocks.empty() && blocks.size() >= 10 && !m_pull_clients.empty())
+    {
+      const size_t batch_size = blocks.size();
+      const uint64_t next_start = blocks_start_height + batch_size;
+      if (next_start < current_height)
+      {
+        const size_t remaining_batches = (size_t)((current_height - next_start + batch_size - 1) / batch_size);
+        const size_t num_parallel = std::min(m_pull_clients.size(), remaining_batches);
+
+        struct PrefetchBatch {
+          std::vector<cryptonote::block_complete_entry> blocks;
+          std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> indices;
+          bool ok = false;
+        };
+        std::vector<PrefetchBatch> batches(num_parallel);
+
+        tools::threadpool& pftpool = tools::threadpool::getInstanceForCompute();
+        tools::threadpool::waiter pfwaiter(pftpool);
+        for (size_t i = 0; i < num_parallel; ++i)
+        {
+          const uint64_t h = next_start + i * batch_size;
+          pftpool.submit(&pfwaiter, [this, &batches, i, h]() {
+            batches[i].ok = pull_blocks_extra(*m_pull_clients[i], h, batches[i].blocks, batches[i].indices);
+          });
+        }
+        THROW_WALLET_EXCEPTION_IF(!pfwaiter.wait(), error::wallet_internal_error, "Exception in prefetch thread pool");
+
+        for (size_t i = 0; i < num_parallel; ++i)
+        {
+          if (!batches[i].ok || batches[i].blocks.empty()) break;
+          for (auto &b : batches[i].blocks) blocks.push_back(std::move(b));
+          for (auto &idx : batches[i].indices) o_indices.push_back(std::move(idx));
+        }
+      }
+    }
 
     tools::threadpool& tpool = tools::threadpool::getInstanceForCompute();
     tools::threadpool::waiter waiter(tpool);
