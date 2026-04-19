@@ -49,6 +49,13 @@ message(STATUS "CMake version ${CMAKE_VERSION}")
 project(monero)
 
 option (USE_CCACHE "Use ccache if a usable instance is found" ON)
+# Cuprate gRPC streaming sync — opt-in. Requires libgrpc++ + protobuf at build time.
+# When enabled, the wallet can pull blocks via a server-streaming gRPC call against
+# a cuprated node with [rpc.grpc] enable=true (see tex8com/cuprate fast-rpc branch).
+# Single HTTP/2 stream typically delivers ~1.6-1.8x more throughput than 16 parallel
+# bin RPC connections — the goal is full link saturation. Default OFF so existing
+# build setups are not affected.
+option (MONERO_ENABLE_GRPC_STREAM "Enable cuprate gRPC streaming sync support" OFF)
 if (USE_CCACHE)
 	include(FindCcache) # Has to be included after the project() macro, to be able to read the CXX variable.
 else()
