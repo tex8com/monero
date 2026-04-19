@@ -76,16 +76,21 @@ namespace epee
     template<class t_request, class t_response, class t_transport>
     bool invoke_http_bin(const boost::string_ref uri, const t_request& out_struct, t_response& result_struct, t_transport& transport, std::chrono::milliseconds timeout = std::chrono::seconds(15), const boost::string_ref method = "POST")
     {
+      auto t_serial0 = std::chrono::steady_clock::now();
       byte_slice req_param;
       if(!serialization::store_t_to_binary(out_struct, req_param, 16 * 1024))
         return false;
+      auto t_serial1 = std::chrono::steady_clock::now();
+      const size_t req_size = req_param.size();
 
       const http::http_response_info* pri = NULL;
+      auto t_http0 = std::chrono::steady_clock::now();
       if(!transport.invoke(uri, method, boost::string_ref{reinterpret_cast<const char*>(req_param.data()), req_param.size()}, timeout, std::addressof(pri)))
       {
         LOG_PRINT_L1("Failed to invoke http request to  " << uri);
         return false;
       }
+      auto t_http1 = std::chrono::steady_clock::now();
 
       if(!pri)
       {
@@ -102,8 +107,12 @@ namespace epee
       // Decompress gzip response if server sent Content-Encoding: gzip
       std::string decompressed_body;
       const std::string* body_ptr = &pri->m_body;
+      const size_t raw_size = pri->m_body.size();
+      bool was_gzip = false;
+      auto t_decomp0 = std::chrono::steady_clock::now();
       if (pri->m_header_info.m_content_encoding.find("gzip") != std::string::npos)
       {
+        was_gzip = true;
         z_stream zs{};
         if (inflateInit2(&zs, 15 + 16) != Z_OK) // 15+16 = gzip format
         {
@@ -130,13 +139,30 @@ namespace epee
         }
         body_ptr = &decompressed_body;
       }
+      auto t_decomp1 = std::chrono::steady_clock::now();
 
       static const constexpr epee::serialization::portable_storage::limits_t default_http_bin_limits = {
         65536 * 3, // objects
         65536 * 3, // fields
         65536 * 3, // strings
       };
-      return serialization::load_t_from_binary(result_struct, epee::strspan<uint8_t>(*body_ptr), &default_http_bin_limits);
+      auto t_deser0 = std::chrono::steady_clock::now();
+      bool ok = serialization::load_t_from_binary(result_struct, epee::strspan<uint8_t>(*body_ptr), &default_http_bin_limits);
+      auto t_deser1 = std::chrono::steady_clock::now();
+
+      // Compact PERF log covering entire HTTP cycle
+      MWARNING("PERF invoke_http_bin uri=" << uri
+        << " req_bytes=" << req_size
+        << " http_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_http1 - t_http0).count()
+        << " raw_resp_bytes=" << raw_size
+        << " gzip=" << was_gzip
+        << " decomp_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_decomp1 - t_decomp0).count()
+        << " decomp_bytes=" << body_ptr->size()
+        << " deser_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_deser1 - t_deser0).count()
+        << " ser_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_serial1 - t_serial0).count()
+        << " ok=" << ok);
+
+      return ok;
     }
 
     template<class t_request, class t_response, class t_transport>
