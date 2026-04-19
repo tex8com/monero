@@ -66,6 +66,13 @@ target_link_libraries(wallet
   PRIVATE
     ${EXTRA_LIBRARIES})
 
+# Optional cuprate gRPC streaming sync support (off by default).
+if(MONERO_ENABLE_GRPC_STREAM)
+  add_subdirectory(grpc_stream)
+  target_link_libraries(wallet PRIVATE cuprate_grpc_stream)
+  target_compile_definitions(wallet PRIVATE MONERO_GRPC_STREAM=1)
+endif()
+
 if(NOT IOS)
   set(wallet_rpc_sources
     wallet_rpc_server.cpp)
