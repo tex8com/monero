@@ -3373,14 +3373,20 @@ void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_heigh
   // Fast path: cuprate gRPC streaming sync. Falls through to bin RPC below
   // if the endpoint is unset, the stream errored, or end-of-stream is hit
   // (next refresh cycle will reopen).
+  //
+  // `first` stays on bin-RPC because that call also requests the mempool
+  // snapshot (requested_info = BLOCKS_AND_POOL), which the stream does not
+  // carry. m_background_syncing deliberately DOES NOT gate here — view-only
+  // Ledger wallets are permanently in background-sync mode and still want
+  // the stream; background sync only affects wallet-side key-image logic,
+  // not the daemon block-transport path.
   if (!m_grpc_stream_endpoint.empty()
       && !m_grpc_stream_fallback_to_bin
-      && !first  // first==true needs pool info, which the grpc path doesn't carry yet
-      && !m_background_syncing)
+      && !first)
   {
     if (try_pull_blocks_grpc(start_height, blocks_start_height, blocks, o_indices, current_height))
     {
-      MDEBUG("Pulled blocks via gRPC stream: start=" << blocks_start_height
+      MWARNING("PERF pull_blocks via gRPC stream: start=" << blocks_start_height
         << " count=" << blocks.size() << " tip=" << current_height);
       return;
     }
@@ -3975,7 +3981,9 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
 
     // Traditional parallel prefetch path (disabled when speculative ran successfully).
     // Still used for iter#1 (first=true → speculative skipped) and for the final catch-up round.
-    if (!do_speculative && !blocks.empty() && blocks.size() >= 10 && !m_pull_clients.empty())
+    // Also disabled when gRPC streaming is active — the stream already delivers
+    // chunks continuously; 16 parallel bin-RPC prefetches would race against it.
+    if (!do_speculative && !grpc_stream_active_now && !blocks.empty() && blocks.size() >= 10 && !m_pull_clients.empty())
     {
       const size_t PREFETCH_BATCH_CAP = 1500;
       const size_t batch_size = std::min(blocks.size(), PREFETCH_BATCH_CAP);
