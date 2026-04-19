@@ -73,6 +73,10 @@
 #include "wallet_light_rpc.h"
 #include "wallet_rpc_helpers.h"
 
+#ifdef MONERO_GRPC_STREAM
+#include "grpc_stream/grpc_block_stream_client.h"
+#endif
+
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "wallet.wallet2"
 
@@ -1079,6 +1083,14 @@ private:
       const std::string &proxy = "");
     bool set_proxy(const std::string &address);
 
+#ifdef MONERO_GRPC_STREAM
+    // Enable streaming sync against a cuprated gRPC BlockStream endpoint.
+    // Pass "" to disable. Format: "host:port" (e.g. "152.53.133.188:18091").
+    // No-op against standard monerod nodes (which don't expose the endpoint).
+    void set_grpc_stream_endpoint(const std::string &endpoint);
+    const std::string& get_grpc_stream_endpoint() const { return m_grpc_stream_endpoint; }
+#endif
+
     void stop() { m_run.store(false, std::memory_order_relaxed); m_message_store.stop(); }
 
     i_wallet2_callback* callback() const { return m_callback; }
@@ -1863,6 +1875,15 @@ private:
      */
     void clear_user_data();
     void pull_blocks(bool first, bool try_incremental, uint64_t start_height, uint64_t& blocks_start_height, const std::list<crypto::hash> &short_chain_history, std::vector<cryptonote::block_complete_entry> &blocks, std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices, uint64_t &current_height);
+#ifdef MONERO_GRPC_STREAM
+    // Try to satisfy a pull_blocks call via the cuprate gRPC stream instead
+    // of bin RPC. Returns true on success (out params populated), false on
+    // any error — caller should fall back to bin RPC for this iteration.
+    bool try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start_height,
+        std::vector<cryptonote::block_complete_entry> &blocks,
+        std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices,
+        uint64_t &current_height);
+#endif
     bool pull_blocks_extra(epee::net_utils::http::abstract_http_client &client, uint64_t start_height, uint64_t max_block_count, std::vector<cryptonote::block_complete_entry> &blocks, std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices);
     void pull_hashes(uint64_t start_height, uint64_t& blocks_start_height, const std::list<crypto::hash> &short_chain_history, std::vector<crypto::hash> &hashes);
     bool pull_hashes_extra(epee::net_utils::http::abstract_http_client &client, uint64_t start_height, std::vector<crypto::hash> &hashes, uint64_t &resp_start_height);
@@ -1974,6 +1995,14 @@ private:
     std::unique_ptr<epee::net_utils::http::http_client_factory> m_http_client_factory;
     const std::unique_ptr<epee::net_utils::http::abstract_http_client> m_http_client;
     std::vector<std::unique_ptr<epee::net_utils::http::abstract_http_client>> m_pull_clients;
+#ifdef MONERO_GRPC_STREAM
+    std::unique_ptr<cuprate_grpc_stream::cuprate_grpc_stream_client> m_grpc_stream_client;
+    std::string  m_grpc_stream_endpoint;
+    std::string  m_grpc_stream_session_id;
+    bool         m_grpc_stream_active = false;
+    bool         m_grpc_stream_fallback_to_bin = false;
+    uint32_t     m_grpc_stream_chunk_hint = 1000;
+#endif
     hashchain m_blockchain;
     serializable_unordered_map<crypto::hash, unconfirmed_transfer_details> m_unconfirmed_txs;
     serializable_unordered_map<crypto::hash, confirmed_transfer_details> m_confirmed_txs;

@@ -1437,6 +1437,21 @@ bool wallet2::set_proxy(const std::string &address)
   return m_http_client->set_proxy(address);
 }
 //----------------------------------------------------------------------------------------------------
+#ifdef MONERO_GRPC_STREAM
+void wallet2::set_grpc_stream_endpoint(const std::string &endpoint)
+{
+  // Close any in-flight stream first (idempotent if none).
+  if (m_grpc_stream_client)
+    m_grpc_stream_client->close();
+  m_grpc_stream_active = false;
+  m_grpc_stream_fallback_to_bin = false;
+  m_grpc_stream_endpoint = endpoint;
+  boost::algorithm::trim(m_grpc_stream_endpoint);
+  MWARNING("grpc_stream endpoint set to '" << m_grpc_stream_endpoint
+    << "' (empty disables streaming sync)");
+}
+#endif
+//----------------------------------------------------------------------------------------------------
 bool wallet2::init(std::string daemon_address, boost::optional<epee::net_utils::http::login> daemon_login, const std::string &proxy_address, uint64_t upper_transaction_weight_limit, bool trusted_daemon, epee::net_utils::ssl_options_t ssl_options)
 {
   m_proxy = proxy_address;
@@ -3246,8 +3261,117 @@ void wallet2::process_pool_info_extent(const cryptonote::COMMAND_RPC_GET_BLOCKS_
   update_pool_state_from_pool_data(res.pool_info_extent == COMMAND_RPC_GET_BLOCKS_FAST::INCREMENTAL, res.removed_pool_txids, added_pool_txs, process_txs, refreshed);
 }
 //----------------------------------------------------------------------------------------------------
+#ifdef MONERO_GRPC_STREAM
+bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start_height,
+    std::vector<cryptonote::block_complete_entry> &blocks,
+    std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices,
+    uint64_t &current_height)
+{
+  if (m_grpc_stream_endpoint.empty() || m_grpc_stream_fallback_to_bin)
+    return false;
+
+  // Open stream on demand. One stream per refresh session, from the current
+  // m_blockchain size onward; server streams until tip, then stream ends.
+  if (!m_grpc_stream_active)
+  {
+    if (!m_grpc_stream_client)
+      m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
+    m_grpc_stream_client->close();
+    if (!m_grpc_stream_client->connect(m_grpc_stream_endpoint))
+    {
+      MWARNING("grpc_stream: connect failed to '" << m_grpc_stream_endpoint
+        << "' err=" << m_grpc_stream_client->last_error_message()
+        << " -- falling back to bin RPC for this session");
+      m_grpc_stream_fallback_to_bin = true;
+      return false;
+    }
+    // Generate a fresh session id so wallet and cuprated PERF logs line up
+    // for this refresh cycle even after a reconnect.
+    std::ostringstream sid;
+    sid << "wallet-" << std::chrono::system_clock::now().time_since_epoch().count()
+        << "-h" << start_height;
+    m_grpc_stream_session_id = sid.str();
+    if (!m_grpc_stream_client->open_stream(start_height, /*stop=*/0, /*prune=*/true,
+        m_grpc_stream_chunk_hint, m_grpc_stream_session_id))
+    {
+      MWARNING("grpc_stream: open_stream failed at start=" << start_height
+        << " err=" << m_grpc_stream_client->last_error_message()
+        << " -- falling back to bin RPC for this iteration");
+      return false;
+    }
+    m_grpc_stream_active = true;
+  }
+
+  std::string payload;
+  if (!m_grpc_stream_client->next_chunk_payload(payload, 60000))
+  {
+    // End-of-stream (tip reached) OR timeout OR error. Close and let
+    // caller fall back to bin RPC for this call. Next refresh cycle opens
+    // a new stream starting at the new current height.
+    const bool ended_ok = m_grpc_stream_client->stream_ended_ok();
+    MWARNING("grpc_stream: next_chunk_payload returned empty "
+      << " (ended_ok=" << ended_ok
+      << " err_code=" << m_grpc_stream_client->last_error_code()
+      << " err='" << m_grpc_stream_client->last_error_message() << "')"
+      << " -- closing stream, falling back to bin RPC for this iteration");
+    m_grpc_stream_client->close();
+    m_grpc_stream_active = false;
+    return false;
+  }
+
+  // Decode the chunk's payload — it's exactly the wire format the bin RPC's
+  // GetBlocks produces, so we can reuse the same deserializer.
+  cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::response res = AUTO_VAL_INIT(res);
+  if (!epee::serialization::load_t_from_binary(res,
+        epee::strspan<uint8_t>(payload)))
+  {
+    MWARNING("grpc_stream: payload deserialization failed ("
+      << payload.size() << " bytes, seq=" << m_grpc_stream_client->last_chunk_seq()
+      << ") -- closing stream, falling back to bin RPC for this session");
+    m_grpc_stream_client->close();
+    m_grpc_stream_active = false;
+    m_grpc_stream_fallback_to_bin = true;
+    return false;
+  }
+  if (res.blocks.size() != res.output_indices.size())
+  {
+    MWARNING("grpc_stream: mismatched blocks (" << res.blocks.size()
+      << ") and output_indices (" << res.output_indices.size()
+      << ") -- falling back to bin RPC for this session");
+    m_grpc_stream_client->close();
+    m_grpc_stream_active = false;
+    m_grpc_stream_fallback_to_bin = true;
+    return false;
+  }
+
+  blocks_start_height = res.start_height;
+  blocks = std::move(res.blocks);
+  o_indices = std::move(res.output_indices);
+  current_height = res.current_height;
+  return true;
+}
+#endif
+//----------------------------------------------------------------------------------------------------
 void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_height, uint64_t &blocks_start_height, const std::list<crypto::hash> &short_chain_history, std::vector<cryptonote::block_complete_entry> &blocks, std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices, uint64_t &current_height)
 {
+#ifdef MONERO_GRPC_STREAM
+  // Fast path: cuprate gRPC streaming sync. Falls through to bin RPC below
+  // if the endpoint is unset, the stream errored, or end-of-stream is hit
+  // (next refresh cycle will reopen).
+  if (!m_grpc_stream_endpoint.empty()
+      && !m_grpc_stream_fallback_to_bin
+      && !first  // first==true needs pool info, which the grpc path doesn't carry yet
+      && !m_background_syncing)
+  {
+    if (try_pull_blocks_grpc(start_height, blocks_start_height, blocks, o_indices, current_height))
+    {
+      MDEBUG("Pulled blocks via gRPC stream: start=" << blocks_start_height
+        << " count=" << blocks.size() << " tip=" << current_height);
+      return;
+    }
+  }
+#endif
+
   cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::request req = AUTO_VAL_INIT(req);
   cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::response res = AUTO_VAL_INIT(res);
   req.block_ids = short_chain_history;
@@ -3734,7 +3858,17 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
     //   - next prefetch batch should start at m_blockchain.size() - 3 + 1000 = m_blockchain.size() + 997
     // If alignment is wrong the gap-validator drops the prefetch cleanly.
     constexpr size_t PREFETCH_BATCH = 1000; // must match pull_blocks' req.max_block_count
-    const bool do_speculative = !first && !m_pull_clients.empty() && !m_background_syncing;
+    // Speculative prefetch uses 16 parallel bin-RPC clients. When gRPC streaming
+    // is active, the single stream IS the prefetch (server pushes continuously) —
+    // spawning parallel bin requests would race against the stream and serve no
+    // purpose.
+#ifdef MONERO_GRPC_STREAM
+    const bool grpc_stream_active_now = !m_grpc_stream_endpoint.empty()
+        && !m_grpc_stream_fallback_to_bin;
+#else
+    const bool grpc_stream_active_now = false;
+#endif
+    const bool do_speculative = !first && !m_pull_clients.empty() && !m_background_syncing && !grpc_stream_active_now;
     struct PrefetchBatch {
       std::vector<cryptonote::block_complete_entry> blocks;
       std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> indices;

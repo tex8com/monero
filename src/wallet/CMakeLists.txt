@@ -69,8 +69,11 @@ target_link_libraries(wallet
 # Optional cuprate gRPC streaming sync support (off by default).
 if(MONERO_ENABLE_GRPC_STREAM)
   add_subdirectory(grpc_stream)
-  target_link_libraries(wallet PRIVATE cuprate_grpc_stream)
-  target_compile_definitions(wallet PRIVATE MONERO_GRPC_STREAM=1)
+  target_link_libraries(wallet PUBLIC cuprate_grpc_stream)
+  # PUBLIC so every consumer of the wallet library sees the same ABI —
+  # wallet2's class layout differs depending on the #ifdef, so downstream
+  # TUs (wallet_rpc_server, simplewallet, monero-wallet-gui) must agree.
+  target_compile_definitions(wallet PUBLIC MONERO_GRPC_STREAM=1)
 endif()
 
 if(NOT IOS)
