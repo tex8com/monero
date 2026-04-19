@@ -29,6 +29,8 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <numeric>
 #include <tuple>
 #include <queue>
@@ -1254,7 +1256,7 @@ wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended, std
   m_light_wallet_balance(0),
   m_light_wallet_unlocked_balance(0),
   m_original_keys_available(false),
-  m_message_store(http_client_factory->create()),
+  m_message_store(m_http_client_factory->create()),
   m_key_device_type(hw::device::device_type::SOFTWARE),
   m_ring_history_saved(true),
   m_ringdb(),
@@ -2336,10 +2338,12 @@ bool wallet2::spends_one_of_ours(const cryptonote::transaction &tx) const
 void wallet2::process_new_transaction(const crypto::hash &txid, const cryptonote::transaction& tx, const std::vector<uint64_t> &o_indices, uint64_t height, uint8_t block_version, uint64_t ts, bool miner_tx, bool pool, bool double_spend_seen, const tx_cache_data &tx_cache_data, std::map<std::pair<uint64_t, uint64_t>, size_t> *output_tracker_cache, bool ignore_callbacks)
 {
   PERF_TIMER(process_new_transaction);
+  auto t_pnt0 = std::chrono::steady_clock::now();
   // In this function, tx (probably) only contains the base information
   // (that is, the prunable stuff may or may not be included)
   if (!miner_tx && !pool)
     process_unconfirmed(txid, tx, height);
+  auto t_pnt_unconf = std::chrono::steady_clock::now();
 
   // per receiving subaddress index
   std::unordered_map<cryptonote::subaddress_index, uint64_t> tx_money_got_in_outs;
@@ -2693,6 +2697,7 @@ void wallet2::process_new_transaction(const crypto::hash &txid, const cryptonote
   }
 
   THROW_WALLET_EXCEPTION_IF(tx_money_got_in_outs.size() != tx_amounts_individual_outs.size(), error::wallet_internal_error, "Inconsistent size of output arrays");
+  auto t_pnt_outputs = std::chrono::steady_clock::now();
 
   uint64_t tx_money_spent_in_ins = 0;
   // The line below is equivalent to "boost::optional<uint32_t> subaddr_account;", but avoids the GCC warning: ‘*((void*)& subaddr_account +4)’ may be used uninitialized in this function
@@ -2967,6 +2972,24 @@ void wallet2::process_new_transaction(const crypto::hash &txid, const cryptonote
     if (tx_notify)
       tx_notify->notify("%s", epee::string_tools::pod_to_hex(txid).c_str(), NULL);
   }
+
+  auto t_pnt_end = std::chrono::steady_clock::now();
+  const uint64_t total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_pnt_end - t_pnt0).count();
+  if (total_us >= 10000) // slow tx >= 10ms -> detail breakdown
+  {
+    const uint64_t unconf_us   = std::chrono::duration_cast<std::chrono::microseconds>(t_pnt_unconf - t_pnt0).count();
+    const uint64_t outputs_us  = std::chrono::duration_cast<std::chrono::microseconds>(t_pnt_outputs - t_pnt_unconf).count();
+    const uint64_t inputs_us   = std::chrono::duration_cast<std::chrono::microseconds>(t_pnt_end - t_pnt_outputs).count();
+    MWARNING("PERF process_new_transaction SLOW txid=" << txid
+      << " total_us=" << total_us
+      << " | unconfirmed_check_us=" << unconf_us
+      << " | output_scan_us=" << outputs_us
+      << " | input_scan_and_tail_us=" << inputs_us
+      << " | vout=" << tx.vout.size() << " vin=" << tx.vin.size()
+      << " received=" << (tx_money_got_in_outs.empty() ? 0 : 1)
+      << " spent_in=" << tx_money_spent_in_ins
+      << " miner=" << miner_tx);
+  }
 }
 //----------------------------------------------------------------------------------------------------
 void wallet2::process_unconfirmed(const crypto::hash &txid, const cryptonote::transaction& tx, uint64_t height)
@@ -3042,35 +3065,69 @@ void wallet2::process_new_blockchain_entry(const cryptonote::block& b, const cry
       " not match with daemon response size=" + std::to_string(parsed_block.o_indices.indices.size()));
 
   //handle transactions from new block
-    
+
   //optimization: seeking only for blocks that are not older then the wallet creation time plus 1 day. 1 day is for possible user incorrect time setup
-  if (!should_skip_block(b, height))
+  auto t_pnbe0 = std::chrono::steady_clock::now();
+  uint64_t miner_tx_us = 0;
+  std::vector<std::pair<size_t, uint64_t>> slow_txs;
+  auto t_skip0 = std::chrono::steady_clock::now();
+  const bool skip = should_skip_block(b, height);
+  auto t_skip1 = std::chrono::steady_clock::now();
+  if (!skip)
   {
-    TIME_MEASURE_START(miner_tx_handle_time);
+    auto t_miner0 = std::chrono::steady_clock::now();
     if (m_refresh_type != RefreshNoCoinbase)
       process_new_transaction(get_transaction_hash(b.miner_tx), b.miner_tx, parsed_block.o_indices.indices[0].indices, height, b.major_version, b.timestamp, true, false, false, tx_cache_data[tx_cache_data_offset], output_tracker_cache);
     ++tx_cache_data_offset;
-    TIME_MEASURE_FINISH(miner_tx_handle_time);
+    auto t_miner1 = std::chrono::steady_clock::now();
+    miner_tx_us = std::chrono::duration_cast<std::chrono::microseconds>(t_miner1 - t_miner0).count();
 
-    TIME_MEASURE_START(txs_handle_time);
     THROW_WALLET_EXCEPTION_IF(bche.txs.size() != b.tx_hashes.size(), error::wallet_internal_error, "Wrong amount of transactions for block");
     THROW_WALLET_EXCEPTION_IF(bche.txs.size() != parsed_block.txes.size(), error::wallet_internal_error, "Wrong amount of transactions for block");
     for (size_t idx = 0; idx < b.tx_hashes.size(); ++idx)
     {
+      auto t_tx0 = std::chrono::steady_clock::now();
       process_new_transaction(b.tx_hashes[idx], parsed_block.txes[idx], parsed_block.o_indices.indices[idx+1].indices, height, b.major_version, b.timestamp, false, false, false, tx_cache_data[tx_cache_data_offset++], output_tracker_cache);
+      auto t_tx1 = std::chrono::steady_clock::now();
+      const uint64_t tx_us = std::chrono::duration_cast<std::chrono::microseconds>(t_tx1 - t_tx0).count();
+      if (tx_us >= 1000) slow_txs.emplace_back(idx, tx_us); // >=1ms
     }
-    TIME_MEASURE_FINISH(txs_handle_time);
     m_last_block_reward = cryptonote::get_outs_money_amount(b.miner_tx);
-    LOG_PRINT_L2("Processed block: " << bl_id << ", height " << height << ", " <<  miner_tx_handle_time + txs_handle_time << "(" << miner_tx_handle_time << "/" << txs_handle_time <<")ms");
-  }else
-  {
-    if (!(height % 128))
-      LOG_PRINT_L2( "Skipped block by timestamp, height: " << height << ", block time " << b.timestamp << ", account time " << m_account.get_createtime());
   }
+  auto t_push0 = std::chrono::steady_clock::now();
   m_blockchain.push_back(bl_id);
+  auto t_push1 = std::chrono::steady_clock::now();
 
+  auto t_cb0 = std::chrono::steady_clock::now();
   if (0 != m_callback)
     m_callback->on_new_block(height, b);
+  auto t_cb1 = std::chrono::steady_clock::now();
+
+  auto t_pnbe1 = std::chrono::steady_clock::now();
+  const uint64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_pnbe1 - t_pnbe0).count();
+  // Detailed breakdown only when block is slow
+  if (total_ms >= 100)
+  {
+    const uint64_t skip_us  = std::chrono::duration_cast<std::chrono::microseconds>(t_skip1 - t_skip0).count();
+    const uint64_t push_us  = std::chrono::duration_cast<std::chrono::microseconds>(t_push1 - t_push0).count();
+    const uint64_t cb_us    = std::chrono::duration_cast<std::chrono::microseconds>(t_cb1 - t_cb0).count();
+    const uint64_t body_us  = std::chrono::duration_cast<std::chrono::microseconds>(t_push0 - t_skip1).count();
+    MWARNING("PERF process_new_blockchain_entry h=" << height << " total_ms=" << total_ms
+      << " skip_check_us=" << skip_us
+      << " body_us=" << body_us
+      << " miner_tx_us=" << miner_tx_us
+      << " push_back_us=" << push_us
+      << " callback_on_new_block_us=" << cb_us
+      << " slow_txs(>1ms)=" << slow_txs.size()
+      << "/" << b.tx_hashes.size()
+      << " skipped=" << skip);
+    // Log each slow tx with its index in the block
+    for (const auto& p : slow_txs)
+    {
+      MWARNING("  SLOW_TX idx=" << p.first << " us=" << p.second
+        << " txid=" << b.tx_hashes[p.first]);
+    }
+  }
 }
 //----------------------------------------------------------------------------------------------------
 void wallet2::get_short_chain_history(std::list<crypto::hash>& ids, uint64_t granularity) const
@@ -3249,6 +3306,7 @@ void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_heigh
 bool wallet2::pull_blocks_extra(
     epee::net_utils::http::abstract_http_client &client,
     uint64_t start_height,
+    uint64_t max_block_count,
     std::vector<cryptonote::block_complete_entry> &blocks,
     std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices)
 {
@@ -3256,15 +3314,75 @@ bool wallet2::pull_blocks_extra(
   cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::response res = AUTO_VAL_INIT(res);
   req.prune = true;
   req.start_height = start_height;
+  req.max_block_count = max_block_count;
   req.no_miner_tx = m_refresh_type == RefreshNoCoinbase;
   req.requested_info = COMMAND_RPC_GET_BLOCKS_FAST::BLOCKS_ONLY;
 
+  std::ostringstream tid_ss; tid_ss << std::this_thread::get_id();
+  MWARNING("PERF pull_blocks_extra BEGIN h=" << start_height << " tid=" << tid_ss.str());
+  auto t0 = std::chrono::steady_clock::now();
   bool r = net_utils::invoke_http_bin("/getblocks.bin", req, res, client, rpc_timeout);
+  auto t1 = std::chrono::steady_clock::now();
+  const auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+  size_t total_bytes = 0, total_outputs = 0, total_txs = 0;
+  for (const auto &b : res.blocks) { total_bytes += b.block.size(); for (const auto &t : b.txs) total_bytes += t.blob.size(); total_txs += b.txs.size(); }
+  for (const auto &bi : res.output_indices) for (const auto &ti : bi.indices) total_outputs += ti.indices.size();
+
   if (!r || res.status != CORE_RPC_STATUS_OK || res.blocks.empty() || res.blocks.size() != res.output_indices.size())
+  {
+    MWARNING("PERF pull_blocks_extra FAILED h=" << start_height
+      << " http_ms=" << http_ms
+      << " r=" << r << " status=" << res.status
+      << " blocks=" << res.blocks.size() << " indices=" << res.output_indices.size()
+      << " tid=" << tid_ss.str());
     return false;
+  }
+
+  MWARNING("PERF pull_blocks_extra OK h=" << start_height
+    << " http_ms=" << http_ms
+    << " blocks=" << res.blocks.size()
+    << " txs=" << total_txs
+    << " outputs=" << total_outputs
+    << " bytes=" << total_bytes
+    << " MBps=" << (http_ms > 0 ? (total_bytes * 1000.0 / http_ms / (1024.0*1024.0)) : 0.0)
+    << " tid=" << tid_ss.str());
 
   blocks = std::move(res.blocks);
   o_indices = std::move(res.output_indices);
+  return true;
+}
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+// Fetch hashes by start_height only (empty block_ids), for parallel fast_refresh.
+// Requires the daemon to handle GetHashes with empty block_ids + start_height > 0.
+bool wallet2::pull_hashes_extra(epee::net_utils::http::abstract_http_client &client, uint64_t start_height, std::vector<crypto::hash> &hashes, uint64_t &resp_start_height)
+{
+  cryptonote::COMMAND_RPC_GET_HASHES_FAST::request req = AUTO_VAL_INIT(req);
+  cryptonote::COMMAND_RPC_GET_HASHES_FAST::response res = AUTO_VAL_INIT(res);
+  // block_ids intentionally empty — daemon must use start_height
+  req.start_height = start_height;
+
+  auto t0 = std::chrono::steady_clock::now();
+  bool r = net_utils::invoke_http_bin("/gethashes.bin", req, res, client, rpc_timeout);
+  auto t1 = std::chrono::steady_clock::now();
+  const auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+  if (!r || res.status != CORE_RPC_STATUS_OK || res.m_block_ids.empty())
+  {
+    MWARNING("PERF pull_hashes_extra FAILED h=" << start_height
+      << " http_ms=" << http_ms << " r=" << r << " status=" << res.status
+      << " hashes=" << res.m_block_ids.size());
+    return false;
+  }
+
+  MWARNING("PERF pull_hashes_extra OK h=" << start_height
+    << " http_ms=" << http_ms
+    << " hashes=" << res.m_block_ids.size()
+    << " resp_start_h=" << res.start_height);
+
+  hashes = std::move(res.m_block_ids);
+  resp_start_height = res.start_height;
   return true;
 }
 //----------------------------------------------------------------------------------------------------
@@ -3280,7 +3398,16 @@ void wallet2::pull_hashes(uint64_t start_height, uint64_t &blocks_start_height, 
     const boost::lock_guard<boost::recursive_mutex> lock{m_daemon_rpc_mutex};
     req.client = get_client_signature();
     uint64_t pre_call_credits = m_rpc_payment_state.credits;
+    auto t0 = std::chrono::steady_clock::now();
     bool r = net_utils::invoke_http_bin("/gethashes.bin", req, res, *m_http_client, rpc_timeout);
+    auto t1 = std::chrono::steady_clock::now();
+    const auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    MWARNING("PERF pull_hashes http_ms=" << http_ms
+      << " req_history=" << short_chain_history.size()
+      << " req_start_h=" << start_height
+      << " resp_hashes=" << res.m_block_ids.size()
+      << " resp_start_h=" << res.start_height
+      << " r=" << r);
     THROW_ON_RPC_RESPONSE_ERROR(r, {}, res, "gethashes.bin", error::get_hashes_error, get_rpc_status(res.status));
     check_rpc_cost("/gethashes.bin", res.credits, pre_call_credits, 1 + res.m_block_ids.size() * COST_PER_BLOCK_HASH);
   }
@@ -3291,20 +3418,37 @@ void wallet2::pull_hashes(uint64_t start_height, uint64_t &blocks_start_height, 
 //----------------------------------------------------------------------------------------------------
 void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cryptonote::block_complete_entry> &blocks, const std::vector<parsed_block> &parsed_blocks, uint64_t& blocks_added, std::map<std::pair<uint64_t, uint64_t>, size_t> *output_tracker_cache)
 {
+  auto t_proc0 = std::chrono::steady_clock::now();
   size_t current_index = start_height;
   blocks_added = 0;
 
   THROW_WALLET_EXCEPTION_IF(blocks.size() != parsed_blocks.size(), error::wallet_internal_error, "size mismatch");
-  THROW_WALLET_EXCEPTION_IF(!m_blockchain.is_in_bounds(current_index), error::out_of_hashchain_bounds_error);
+  if (!m_blockchain.is_in_bounds(current_index))
+  {
+    MWARNING("PERF HASHCHAIN_BOUNDS_FAIL start_height=" << start_height
+      << " current_index=" << current_index
+      << " m_blockchain.size=" << m_blockchain.size()
+      << " m_blockchain.offset=" << m_blockchain.offset()
+      << " blocks=" << blocks.size());
+    THROW_WALLET_EXCEPTION(error::out_of_hashchain_bounds_error);
+  }
 
   tools::threadpool& tpool = tools::threadpool::getInstanceForCompute();
   tools::threadpool::waiter waiter(tpool);
 
   size_t num_txes = 0;
+  size_t num_outputs = 0;
   std::vector<tx_cache_data> tx_cache_data;
-  for (size_t i = 0; i < blocks.size(); ++i)
+  for (size_t i = 0; i < blocks.size(); ++i) {
     num_txes += 1 + parsed_blocks[i].txes.size();
+    num_outputs += parsed_blocks[i].block.miner_tx.vout.size();
+    for (const auto &tx : parsed_blocks[i].txes) num_outputs += tx.vout.size();
+  }
   tx_cache_data.resize(num_txes);
+  MWARNING("PERF process_parsed_blocks START start_height=" << start_height
+    << " blocks=" << blocks.size() << " txs=" << num_txes << " outputs=" << num_outputs
+    << " m_blockchain.size=" << m_blockchain.size());
+  auto t_hash0 = std::chrono::steady_clock::now();
   size_t txidx = 0;
   for (size_t i = 0; i < blocks.size(); ++i)
   {
@@ -3326,11 +3470,15 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
   }
   THROW_WALLET_EXCEPTION_IF(txidx != num_txes, error::wallet_internal_error, "txidx does not match tx_cache_data size");
   THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  auto t_hash1 = std::chrono::steady_clock::now();
+  MWARNING("PERF process_parsed_blocks: cache_tx_data(hash) " << num_txes << " txs in "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(t_hash1 - t_hash0).count() << "ms");
 
   hw::device &hwdev =  m_account.get_device();
   hw::reset_mode rst(hwdev);
   hwdev.set_mode(hw::device::TRANSACTION_PARSE);
   const cryptonote::account_keys &keys = m_account.get_keys();
+  auto t_gender0 = std::chrono::steady_clock::now();
 
   auto gender = [&](wallet2::is_out_data &iod) {
     if (!hwdev.generate_key_derivation(iod.pkey, keys.m_view_secret_key, iod.derivation))
@@ -3354,6 +3502,10 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
     }, true);
   }
   THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  auto t_gender1 = std::chrono::steady_clock::now();
+  MWARNING("PERF process_parsed_blocks: generate_key_derivation phase in "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(t_gender1 - t_gender0).count() << "ms");
+  auto t_geniod0 = std::chrono::steady_clock::now();
 
   auto geniod = [&](const cryptonote::transaction &tx, size_t n_vouts, size_t txidx) {
     for (size_t k = 0; k < n_vouts; ++k)
@@ -3444,15 +3596,25 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
     THROW_WALLET_EXCEPTION_IF(num_batch_txes != geniods.size(), error::wallet_internal_error, "txes batched for thread pool did not reach expected value");
   }
   THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  auto t_geniod1 = std::chrono::steady_clock::now();
+  MWARNING("PERF process_parsed_blocks: geniod(scan outputs) " << num_outputs << " outputs in "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(t_geniod1 - t_geniod0).count() << "ms");
 
   hwdev.set_mode(hw::device::NONE);
 
+  auto t_chain0 = std::chrono::steady_clock::now();
   size_t tx_cache_data_offset = 0;
+  // Track per-block time to find hot blocks
+  size_t slow_blocks = 0;
+  uint64_t slow_blocks_total_ms = 0;
+  struct HotBlock { uint64_t height; uint64_t ms; size_t txs; size_t outputs; };
+  std::vector<HotBlock> hot_blocks;
   for (size_t i = 0; i < blocks.size(); ++i)
   {
     const crypto::hash &bl_id = parsed_blocks[i].hash;
     const cryptonote::block &bl = parsed_blocks[i].block;
 
+    auto t_blk0 = std::chrono::steady_clock::now();
     if(current_index >= m_blockchain.size())
     {
       process_new_blockchain_entry(bl, blocks[i], parsed_blocks[i], bl_id, current_index, tx_cache_data, tx_cache_data_offset, output_tracker_cache);
@@ -3478,9 +3640,37 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
     {
       LOG_PRINT_L2("Block is already in blockchain: " << string_tools::pod_to_hex(bl_id));
     }
+    auto t_blk1 = std::chrono::steady_clock::now();
+    const uint64_t blk_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_blk1 - t_blk0).count();
+
+    // Log any block that took >= 10ms — these are the real bottlenecks
+    if (blk_ms >= 10)
+    {
+      ++slow_blocks;
+      slow_blocks_total_ms += blk_ms;
+      size_t n_outputs_in_block = parsed_blocks[i].block.miner_tx.vout.size();
+      for (const auto &tx : parsed_blocks[i].txes) n_outputs_in_block += tx.vout.size();
+      if (hot_blocks.size() < 20) // keep top-20 examples
+        hot_blocks.push_back({current_index, blk_ms, 1 + parsed_blocks[i].txes.size(), n_outputs_in_block});
+    }
+
     ++current_index;
     tx_cache_data_offset += 1 + parsed_blocks[i].txes.size();
   }
+  if (slow_blocks > 0)
+  {
+    MWARNING("PERF chain-integration SLOW BLOCKS: " << slow_blocks << "/" << blocks.size()
+      << " blocks took >=10ms (total " << slow_blocks_total_ms << "ms of "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_chain0).count() << "ms)");
+    for (const auto& hb : hot_blocks)
+      MWARNING("  HOT_BLOCK h=" << hb.height << " ms=" << hb.ms << " txs=" << hb.txs << " outputs=" << hb.outputs);
+  }
+  auto t_chain1 = std::chrono::steady_clock::now();
+  MWARNING("PERF process_parsed_blocks: chain-integration " << blocks.size() << " blocks in "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(t_chain1 - t_chain0).count() << "ms"
+    << " blocks_added=" << blocks_added);
+  MWARNING("PERF process_parsed_blocks TOTAL " << blocks.size() << " blocks, " << num_outputs << " outputs in "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(t_chain1 - t_proc0).count() << "ms");
 }
 //----------------------------------------------------------------------------------------------------
 void wallet2::refresh(bool trusted_daemon)
@@ -3537,8 +3727,14 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
     // pull the new blocks
     std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> o_indices;
     uint64_t current_height;
+    auto t0_pull = std::chrono::steady_clock::now();
     pull_blocks(first, try_incremental, start_height, blocks_start_height, short_chain_history, blocks, o_indices, current_height);
     THROW_WALLET_EXCEPTION_IF(blocks.size() != o_indices.size(), error::wallet_internal_error, "Mismatched sizes of blocks and o_indices");
+    auto t1_pull = std::chrono::steady_clock::now();
+    MWARNING("PERF pull_blocks: " << blocks.size() << " blocks at height " << blocks_start_height
+      << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(t1_pull - t0_pull).count() << "ms"
+      << " | remaining=" << (current_height > blocks_start_height + blocks.size() ? current_height - blocks_start_height - blocks.size() : 0)
+      << " | parallel_clients=" << m_pull_clients.size());
 
     // parallel prefetch of subsequent batches using dedicated connections
     if (!blocks.empty() && blocks.size() >= 10 && !m_pull_clients.empty())
@@ -3557,24 +3753,56 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
         };
         std::vector<PrefetchBatch> batches(num_parallel);
 
-        tools::threadpool& pftpool = tools::threadpool::getInstanceForCompute();
-        tools::threadpool::waiter pfwaiter(pftpool);
+        auto t0_pf = std::chrono::steady_clock::now();
+        // Use real threads for parallel HTTP I/O (compute threadpool serialises blocking calls).
+        // Pass batch_size as max_block_count so daemon returns at most batch_size blocks — this
+        // aligns batch boundaries with the pre-computed start_height for each batch.
+        std::vector<std::thread> pf_threads;
+        pf_threads.reserve(num_parallel);
         for (size_t i = 0; i < num_parallel; ++i)
         {
           const uint64_t h = next_start + i * batch_size;
-          pftpool.submit(&pfwaiter, [this, &batches, i, h]() {
-            batches[i].ok = pull_blocks_extra(*m_pull_clients[i], h, batches[i].blocks, batches[i].indices);
+          pf_threads.emplace_back([this, &batches, i, h, batch_size]() {
+            batches[i].ok = pull_blocks_extra(*m_pull_clients[i], h, batch_size, batches[i].blocks, batches[i].indices);
           });
         }
-        THROW_WALLET_EXCEPTION_IF(!pfwaiter.wait(), error::wallet_internal_error, "Exception in prefetch thread pool");
+        for (auto& t : pf_threads) t.join();
+        auto t1_pf = std::chrono::steady_clock::now();
 
+        size_t prefetched = 0;
+        // Contiguity validation: each batch was requested at requested_start[i] = next_start + i*batch_size
+        // but the daemon may return FEWER than batch_size blocks, leaving a gap before batch[i+1].
+        // We must stop as soon as a gap is detected, otherwise wallet pushes hashes at wrong heights
+        // into m_blockchain, corrupting the chain.
+        uint64_t expected_next_h = next_start;
         for (size_t i = 0; i < num_parallel; ++i)
         {
+          const uint64_t requested_h = next_start + i * batch_size;
+          MWARNING("PERF prefetch_batch[" << i << "]: ok=" << batches[i].ok
+            << " blocks=" << batches[i].blocks.size()
+            << " requested_h=" << requested_h << " expected_h=" << expected_next_h);
           if (!batches[i].ok || batches[i].blocks.empty()) break;
+          if (requested_h != expected_next_h)
+          {
+            MWARNING("PERF prefetch_batch[" << i << "]: GAP DETECTED - requested_h=" << requested_h
+              << " but expected_h=" << expected_next_h << " (previous batch returned fewer than "
+              << batch_size << " blocks). Discarding this and remaining batches.");
+            break;
+          }
+          prefetched += batches[i].blocks.size();
+          expected_next_h = requested_h + batches[i].blocks.size();
           for (auto &b : batches[i].blocks) blocks.push_back(std::move(b));
           for (auto &idx : batches[i].indices) o_indices.push_back(std::move(idx));
         }
+        MWARNING("PERF parallel_prefetch: " << num_parallel << " connections, "
+          << prefetched << " extra blocks in "
+          << std::chrono::duration_cast<std::chrono::milliseconds>(t1_pf - t0_pf).count() << "ms"
+          << " | total_blocks_this_round=" << blocks.size());
       }
+    }
+    else if (m_pull_clients.empty())
+    {
+      MWARNING("PERF parallel_prefetch: SKIPPED (no parallel clients configured)");
     }
 
     tools::threadpool& tpool = tools::threadpool::getInstanceForCompute();
@@ -4045,14 +4273,29 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
   }
 
   size_t current_index = m_blockchain.size();
+
+  auto t_fr0 = std::chrono::steady_clock::now();
+  size_t fr_rounds = 0;
+
   while(m_run.load(std::memory_order_relaxed) && current_index < stop_height)
   {
+    ++fr_rounds;
+    // First round: sequential pull_hashes with short_chain_history to get daemon to tell us
+    // where to start (first_known_height). Subsequent rounds: we know the daemon's tip layout,
+    // so we can parallel-fetch hash batches using start_height only (empty block_ids path).
     pull_hashes(0, blocks_start_height, short_chain_history, hashes);
     if (hashes.size() <= 3)
       return;
     if (blocks_start_height < m_blockchain.offset())
     {
       MERROR("Blocks start before blockchain offset: " << blocks_start_height << " " << m_blockchain.offset());
+      return;
+    }
+    if (blocks_start_height > m_blockchain.size())
+    {
+      MWARNING("PERF fast_refresh CORRUPTION DETECTED: daemon returned blocks_start_height="
+        << blocks_start_height << " but m_blockchain.size=" << m_blockchain.size()
+        << " - aborting fast_refresh to avoid creating a gap in m_blockchain");
       return;
     }
     current_index = blocks_start_height;
@@ -4088,7 +4331,99 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
       if (current_index >= stop_height)
         return;
     }
+
+    // PARALLEL FAST REFRESH: after the sequential pull_hashes establishes alignment,
+    // spawn up to N_PAR parallel pull_hashes_extra calls (empty block_ids, start_height only).
+    // This requires the daemon to handle GetHashes with empty block_ids + start_height > 0.
+    if (!m_pull_clients.empty() && current_index < stop_height && hashes.size() >= 1000)
+    {
+      // Must match the daemon's max batch size for empty-block_ids GetHashes.
+      // Server returns up to 100k hashes (3.2MB) per DIRECT-BULK request.
+      const size_t HASH_BATCH = 100000;
+      while (m_run.load(std::memory_order_relaxed) && current_index < stop_height)
+      {
+        const uint64_t remaining = stop_height - current_index;
+        const size_t batches_needed = (size_t)((remaining + HASH_BATCH - 1) / HASH_BATCH);
+        const size_t n_par = std::min(m_pull_clients.size(), batches_needed);
+        if (n_par <= 1) break; // not worth parallelising
+
+        struct HashBatch {
+          std::vector<crypto::hash> hashes;
+          uint64_t resp_start_height = 0;
+          bool ok = false;
+        };
+        std::vector<HashBatch> batches(n_par);
+
+        auto t_pf0 = std::chrono::steady_clock::now();
+        // Snapshot current_index BEFORE dispatch — this is the base height that each batch's
+        // requested_h is computed from. current_index will advance during validation/push,
+        // so we must not recompute requested_h from the (mutated) current_index inside the loop.
+        const uint64_t base_h = current_index;
+        std::vector<std::thread> threads;
+        threads.reserve(n_par);
+        for (size_t i = 0; i < n_par; ++i)
+        {
+          const uint64_t h = base_h + i * HASH_BATCH;
+          threads.emplace_back([this, &batches, i, h]() {
+            batches[i].ok = pull_hashes_extra(*m_pull_clients[i], h, batches[i].hashes, batches[i].resp_start_height);
+          });
+        }
+        for (auto& t : threads) t.join();
+        auto t_pf1 = std::chrono::steady_clock::now();
+
+        size_t pushed_this_round = 0;
+        bool stopped = false;
+        for (size_t i = 0; i < n_par; ++i)
+        {
+          if (!batches[i].ok) { stopped = true; break; }
+          const uint64_t requested_h = base_h + i * HASH_BATCH;
+          if (batches[i].resp_start_height != requested_h)
+          {
+            MWARNING("PERF fast_refresh parallel batch[" << i << "] resp_start=" << batches[i].resp_start_height
+              << " expected=" << requested_h << " — discarding this and remaining");
+            stopped = true;
+            break;
+          }
+          for (auto& bl_id : batches[i].hashes)
+          {
+            if (current_index >= m_blockchain.size())
+            {
+              m_blockchain.push_back(bl_id);
+              if (0 != m_callback)
+              {
+                cryptonote::block dummy;
+                m_callback->on_new_block(current_index, dummy);
+              }
+            }
+            else if (bl_id != m_blockchain[current_index])
+            {
+              MWARNING("PERF fast_refresh parallel: split detected at h=" << current_index);
+              stopped = true;
+              break;
+            }
+            ++current_index;
+            ++pushed_this_round;
+            if (current_index >= stop_height) { stopped = true; break; }
+          }
+          if (stopped) break;
+        }
+
+        MWARNING("PERF fast_refresh parallel: " << n_par << " clients pushed " << pushed_this_round
+          << " hashes in " << std::chrono::duration_cast<std::chrono::milliseconds>(t_pf1 - t_pf0).count() << "ms"
+          << " current_index=" << current_index << " stop=" << stop_height);
+
+        if (stopped || pushed_this_round == 0) break;
+      }
+
+      // rebuild short_chain_history based on advanced m_blockchain for any following sequential pull_hashes
+      short_chain_history.clear();
+      get_short_chain_history(short_chain_history);
+    }
   }
+  auto t_fr1 = std::chrono::steady_clock::now();
+  MWARNING("PERF fast_refresh DONE rounds=" << fr_rounds << " current_index=" << current_index
+    << " stop_height=" << stop_height
+    << " total_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_fr1 - t_fr0).count());
 }
 
 
@@ -4252,8 +4587,12 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
   // infer when we get an incoming output
 
   bool first = true, last = false;
+  size_t iter_count = 0;
+  auto t_refresh_start = std::chrono::steady_clock::now();
   while(m_run.load(std::memory_order_relaxed) && blocks_fetched < max_blocks)
   {
+    ++iter_count;
+    auto t_iter0 = std::chrono::steady_clock::now();
     uint64_t next_blocks_start_height;
     std::vector<cryptonote::block_complete_entry> next_blocks;
     std::vector<parsed_block> next_parsed_blocks;
@@ -4272,6 +4611,11 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
         m_node_rpc_proxy.set_height(m_blockchain.size());
         break;
       }
+      MWARNING("PERF refresh_iter#" << iter_count << " BEGIN first=" << first << " last=" << last
+        << " blocks_fetched=" << blocks_fetched
+        << " m_blockchain.size=" << m_blockchain.size()
+        << " blocks_pending_processing=" << blocks.size());
+      auto t_submit0 = std::chrono::steady_clock::now();
       if (!last)
         tpool.submit(&waiter, [&]{pull_and_parse_next_blocks(first, try_incremental, start_height, next_blocks_start_height, short_chain_history, blocks, parsed_blocks, next_blocks, next_parsed_blocks, last, error, exception);});
 
@@ -4279,10 +4623,45 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
       {
         try
         {
+          auto t0_proc = std::chrono::steady_clock::now();
           process_parsed_blocks(blocks_start_height, blocks, parsed_blocks, added_blocks, output_tracker_cache.get());
+          auto t1_proc = std::chrono::steady_clock::now();
+          MWARNING("PERF refresh_iter#" << iter_count << " process_parsed_blocks wrapper: "
+            << blocks.size() << " blocks in "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(t1_proc - t0_proc).count() << "ms");
         }
         catch (const tools::error::out_of_hashchain_bounds_error&)
         {
+          MWARNING("PERF HASHCHAIN_BOUNDS recovery: blocks_start_height=" << blocks_start_height
+            << " m_blockchain.size=" << m_blockchain.size()
+            << " m_blockchain.offset=" << m_blockchain.offset());
+
+          // Corruption case: daemon claims blocks start ABOVE our chain tip.
+          // Re-appending the stored tip hashes would just re-create the same broken
+          // mapping. Instead, truncate m_blockchain back to a safe point (offset)
+          // and force a clean fast_refresh up to the daemon's blocks_start_height.
+          if (blocks_start_height > m_blockchain.size())
+          {
+            const uint64_t gap = blocks_start_height - m_blockchain.size();
+            MWARNING("PERF HASHCHAIN_BOUNDS: CORRUPTED chain detected (gap=" << gap << " blocks). "
+              << "Truncating wallet hashchain to offset=" << m_blockchain.offset()
+              << " and re-syncing hashes up to daemon tip.");
+
+            cryptonote::block b;
+            generate_genesis(b);
+            m_blockchain.clear();
+            m_blockchain.push_back(get_block_hash(b));
+            short_chain_history.clear();
+            get_short_chain_history(short_chain_history);
+            // fast_refresh will detect further corruption and bail out cleanly via
+            // its own blocks_start_height > m_blockchain.size guard
+            fast_refresh(blocks_start_height, blocks_start_height, short_chain_history, true);
+            short_chain_history.clear();
+            get_short_chain_history(short_chain_history);
+            start_height = 0;
+            throw std::runtime_error(""); // loop again
+          }
+
           MINFO("Daemon claims next refresh block is out of hash chain bounds, resetting hash chain");
           uint64_t stop_height = m_blockchain.offset();
           std::vector<crypto::hash> tip(m_blockchain.size() - m_blockchain.offset());
@@ -4342,6 +4721,13 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
       blocks_start_height = next_blocks_start_height;
       blocks = std::move(next_blocks);
       parsed_blocks = std::move(next_parsed_blocks);
+      auto t_iter1 = std::chrono::steady_clock::now();
+      MWARNING("PERF refresh_iter#" << iter_count << " END in "
+        << std::chrono::duration_cast<std::chrono::milliseconds>(t_iter1 - t_iter0).count() << "ms"
+        << " blocks_fetched=" << blocks_fetched
+        << " iter_blocks=" << added_blocks
+        << " next_blocks_queued=" << blocks.size()
+        << " cumulative_refresh_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_iter1 - t_refresh_start).count());
     }
     catch (const tools::error::password_needed&)
     {
