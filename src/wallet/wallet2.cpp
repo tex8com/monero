@@ -3256,6 +3256,9 @@ void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_heigh
 
   req.prune = true;
   req.start_height = start_height;
+  // 1000 blocks ≈ 17MB per response, safely below both 50MB server limit and epee object limits.
+  // Must match PREFETCH_BATCH in pull_and_parse_next_blocks' speculative prefetch.
+  req.max_block_count = 1000;
   req.no_miner_tx = m_refresh_type == RefreshNoCoinbase;
 
   req.requested_info = (first && !m_background_syncing) ? COMMAND_RPC_GET_BLOCKS_FAST::BLOCKS_AND_POOL : COMMAND_RPC_GET_BLOCKS_FAST::BLOCKS_ONLY;
@@ -3705,7 +3708,7 @@ void check_block_hard_fork_version(cryptonote::network_type nettype, uint8_t hf_
   daemon_is_outdated = height < start_height || height >= end_height;
 }
 //----------------------------------------------------------------------------------------------------
-void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint64_t start_height, uint64_t &blocks_start_height, std::list<crypto::hash> &short_chain_history, const std::vector<cryptonote::block_complete_entry> &prev_blocks, const std::vector<parsed_block> &prev_parsed_blocks, std::vector<cryptonote::block_complete_entry> &blocks, std::vector<parsed_block> &parsed_blocks, bool &last, bool &error, std::exception_ptr &exception)
+void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint64_t start_height, uint64_t &blocks_start_height, uint64_t prev_blocks_start_height, std::list<crypto::hash> &short_chain_history, const std::vector<cryptonote::block_complete_entry> &prev_blocks, const std::vector<parsed_block> &prev_parsed_blocks, std::vector<cryptonote::block_complete_entry> &blocks, std::vector<parsed_block> &parsed_blocks, bool &last, bool &error, std::exception_ptr &exception)
 {
   error = false;
   last = false;
@@ -3724,7 +3727,54 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
       short_chain_history.push_front(s->hash);
     }
 
-    // pull the new blocks
+    // Pre-launch speculative parallel prefetch BEFORE main pull_blocks to eliminate
+    // the serial wait (~15s per iter). We assume:
+    //   - main pull_blocks will return starting at m_blockchain.size() - 3 (overlap)
+    //     and deliver exactly PREFETCH_BATCH (=1000) blocks (matches max_block_count=1000 in pull_blocks)
+    //   - next prefetch batch should start at m_blockchain.size() - 3 + 1000 = m_blockchain.size() + 997
+    // If alignment is wrong the gap-validator drops the prefetch cleanly.
+    constexpr size_t PREFETCH_BATCH = 1000; // must match pull_blocks' req.max_block_count
+    const bool do_speculative = !first && !m_pull_clients.empty() && !m_background_syncing;
+    struct PrefetchBatch {
+      std::vector<cryptonote::block_complete_entry> blocks;
+      std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> indices;
+      bool ok = false;
+    };
+    std::vector<PrefetchBatch> spec_batches;
+    std::vector<std::thread> spec_threads;
+    uint64_t spec_base = 0;
+    size_t spec_num = 0;
+    // RAII guard: join all speculative threads on any exit path (including exceptions)
+    // to prevent std::terminate() from destructing joinable threads.
+    auto spec_thread_guard = epee::misc_utils::create_scope_leave_handler([&spec_threads]() {
+      for (auto& t : spec_threads) {
+        if (t.joinable()) t.join();
+      }
+    });
+    if (do_speculative && !prev_blocks.empty())
+    {
+      // Daemon matches the newest hash in short_chain_history (prev_parsed_blocks.back())
+      // which is at height prev_blocks_start_height + prev_blocks.size() - 1. Main pull
+      // returns PREFETCH_BATCH blocks starting from that height (with 1-block overlap).
+      // So the next speculative batch starts at:
+      //   prev_blocks_start_height + prev_blocks.size() - 1 + PREFETCH_BATCH
+      spec_base = prev_blocks_start_height + prev_blocks.size() + PREFETCH_BATCH - 1;
+      spec_num = m_pull_clients.size();
+      spec_batches.resize(spec_num);
+      spec_threads.reserve(spec_num);
+      auto t_spec0 = std::chrono::steady_clock::now();
+      for (size_t i = 0; i < spec_num; ++i)
+      {
+        const uint64_t h = spec_base + i * PREFETCH_BATCH;
+        spec_threads.emplace_back([this, &spec_batches, i, h]() {
+          spec_batches[i].ok = pull_blocks_extra(*m_pull_clients[i], h, PREFETCH_BATCH, spec_batches[i].blocks, spec_batches[i].indices);
+        });
+      }
+      (void)t_spec0;
+      MWARNING("PERF speculative_prefetch LAUNCHED clients=" << spec_num << " base_h=" << spec_base);
+    }
+
+    // pull the new blocks (main, uses m_http_client — runs CONCURRENTLY with speculative prefetch above)
     std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> o_indices;
     uint64_t current_height;
     auto t0_pull = std::chrono::steady_clock::now();
@@ -3736,21 +3786,56 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
       << " | remaining=" << (current_height > blocks_start_height + blocks.size() ? current_height - blocks_start_height - blocks.size() : 0)
       << " | parallel_clients=" << m_pull_clients.size());
 
-    // parallel prefetch of subsequent batches using dedicated connections
-    if (!blocks.empty() && blocks.size() >= 10 && !m_pull_clients.empty())
+    // Wait for speculative prefetch and merge if alignment matches
+    if (do_speculative)
     {
-      const size_t batch_size = blocks.size();
-      const uint64_t next_start = blocks_start_height + batch_size;
+      auto t_join0 = std::chrono::steady_clock::now();
+      for (auto& t : spec_threads) t.join();
+      auto t_join1 = std::chrono::steady_clock::now();
+      const uint64_t expected_base = blocks_start_height + blocks.size();
+      const bool aligned = (expected_base == spec_base);
+      size_t appended = 0;
+      if (aligned && !blocks.empty())
+      {
+        uint64_t expected_next_h = spec_base;
+        for (size_t i = 0; i < spec_num; ++i)
+        {
+          if (!spec_batches[i].ok || spec_batches[i].blocks.empty()) break;
+          const uint64_t requested_h = spec_base + i * PREFETCH_BATCH;
+          if (requested_h != expected_next_h)
+          {
+            MWARNING("PERF speculative_prefetch batch[" << i << "] gap requested_h=" << requested_h
+              << " expected=" << expected_next_h << " — dropping remainder");
+            break;
+          }
+          for (auto& b : spec_batches[i].blocks) blocks.push_back(std::move(b));
+          for (auto& idx : spec_batches[i].indices) o_indices.push_back(std::move(idx));
+          appended += spec_batches[i].blocks.size();
+          expected_next_h = requested_h + spec_batches[i].blocks.size();
+        }
+      }
+      else
+      {
+        MWARNING("PERF speculative_prefetch MISS expected_base=" << expected_base << " spec_base=" << spec_base
+          << " blocks_empty=" << blocks.empty() << " — discarding all " << spec_num << " speculative batches");
+      }
+      MWARNING("PERF speculative_prefetch JOIN join_ms="
+        << std::chrono::duration_cast<std::chrono::milliseconds>(t_join1 - t_join0).count()
+        << " aligned=" << aligned << " appended_blocks=" << appended << " clients=" << spec_num);
+    }
+
+    // Traditional parallel prefetch path (disabled when speculative ran successfully).
+    // Still used for iter#1 (first=true → speculative skipped) and for the final catch-up round.
+    if (!do_speculative && !blocks.empty() && blocks.size() >= 10 && !m_pull_clients.empty())
+    {
+      const size_t PREFETCH_BATCH_CAP = 1500;
+      const size_t batch_size = std::min(blocks.size(), PREFETCH_BATCH_CAP);
+      const uint64_t next_start = blocks_start_height + blocks.size();
       if (next_start < current_height)
       {
         const size_t remaining_batches = (size_t)((current_height - next_start + batch_size - 1) / batch_size);
         const size_t num_parallel = std::min(m_pull_clients.size(), remaining_batches);
 
-        struct PrefetchBatch {
-          std::vector<cryptonote::block_complete_entry> blocks;
-          std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> indices;
-          bool ok = false;
-        };
         std::vector<PrefetchBatch> batches(num_parallel);
 
         auto t0_pf = std::chrono::steady_clock::now();
@@ -3758,6 +3843,10 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
         // Pass batch_size as max_block_count so daemon returns at most batch_size blocks — this
         // aligns batch boundaries with the pre-computed start_height for each batch.
         std::vector<std::thread> pf_threads;
+        // RAII guard — join threads on every exit path, prevents std::terminate
+        auto pf_thread_guard = epee::misc_utils::create_scope_leave_handler([&pf_threads]() {
+          for (auto& t : pf_threads) { if (t.joinable()) t.join(); }
+        });
         pf_threads.reserve(num_parallel);
         for (size_t i = 0; i < num_parallel; ++i)
         {
@@ -4360,6 +4449,10 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
         // so we must not recompute requested_h from the (mutated) current_index inside the loop.
         const uint64_t base_h = current_index;
         std::vector<std::thread> threads;
+        // RAII guard — join on every exit path
+        auto hash_thread_guard = epee::misc_utils::create_scope_leave_handler([&threads]() {
+          for (auto& t : threads) { if (t.joinable()) t.join(); }
+        });
         threads.reserve(n_par);
         for (size_t i = 0; i < n_par; ++i)
         {
@@ -4617,7 +4710,12 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
         << " blocks_pending_processing=" << blocks.size());
       auto t_submit0 = std::chrono::steady_clock::now();
       if (!last)
-        tpool.submit(&waiter, [&]{pull_and_parse_next_blocks(first, try_incremental, start_height, next_blocks_start_height, short_chain_history, blocks, parsed_blocks, next_blocks, next_parsed_blocks, last, error, exception);});
+      {
+        // Capture prev blocks_start_height by value for speculative prefetch.
+        // (blocks_start_height is mutated later in this iteration — we must snapshot now.)
+        const uint64_t prev_start_snapshot = blocks_start_height;
+        tpool.submit(&waiter, [&, prev_start_snapshot]{pull_and_parse_next_blocks(first, try_incremental, start_height, next_blocks_start_height, prev_start_snapshot, short_chain_history, blocks, parsed_blocks, next_blocks, next_parsed_blocks, last, error, exception);});
+      }
 
       if (!first)
       {
