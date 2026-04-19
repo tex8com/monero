@@ -26,8 +26,10 @@
 // 
 
 #pragma once
+#include <atomic>
 #include <boost/utility/string_ref.hpp>
 #include <chrono>
+#include <sstream>
 #include <string>
 #include <zlib.h>
 #include "byte_slice.h"
@@ -73,9 +75,22 @@ namespace epee
 
 
 
+    // Global counter used to generate unique per-session request IDs.
+    // Seeded with a random component so IDs from different wallet runs don't collide in logs.
+    inline uint64_t next_perf_request_id()
+    {
+      static std::atomic<uint64_t> seed{
+        static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count()) & 0xFFFFFFFFULL
+      };
+      static std::atomic<uint64_t> counter{0};
+      const uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
+      return (seed.load(std::memory_order_relaxed) << 20) | (n & 0xFFFFFULL);
+    }
+
     template<class t_request, class t_response, class t_transport>
     bool invoke_http_bin(const boost::string_ref uri, const t_request& out_struct, t_response& result_struct, t_transport& transport, std::chrono::milliseconds timeout = std::chrono::seconds(15), const boost::string_ref method = "POST")
     {
+      const uint64_t perf_req_id = next_perf_request_id();
       auto t_serial0 = std::chrono::steady_clock::now();
       byte_slice req_param;
       if(!serialization::store_t_to_binary(out_struct, req_param, 16 * 1024))
@@ -83,14 +98,26 @@ namespace epee
       auto t_serial1 = std::chrono::steady_clock::now();
       const size_t req_size = req_param.size();
 
+      http::fields_list additional_params;
+      {
+        std::ostringstream oss; oss << perf_req_id;
+        additional_params.emplace_back("X-Perf-Req-Id", oss.str());
+      }
+
+      // Wall-clock timestamp (UNIX ms) for correlation with server logs (no shared monotonic clock).
+      const auto t_send_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
       const http::http_response_info* pri = NULL;
       auto t_http0 = std::chrono::steady_clock::now();
-      if(!transport.invoke(uri, method, boost::string_ref{reinterpret_cast<const char*>(req_param.data()), req_param.size()}, timeout, std::addressof(pri)))
+      if(!transport.invoke(uri, method, boost::string_ref{reinterpret_cast<const char*>(req_param.data()), req_param.size()}, timeout, std::addressof(pri), std::move(additional_params)))
       {
         LOG_PRINT_L1("Failed to invoke http request to  " << uri);
         return false;
       }
       auto t_http1 = std::chrono::steady_clock::now();
+      const auto t_recv_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 
       if(!pri)
       {
@@ -141,17 +168,26 @@ namespace epee
       }
       auto t_decomp1 = std::chrono::steady_clock::now();
 
+      // Limits raised from 65536*3 to 65536*16 to accommodate bulk block responses
+      // (2000 blocks × ~40 txs × multiple nested structs easily exceeds 200k objects).
       static const constexpr epee::serialization::portable_storage::limits_t default_http_bin_limits = {
-        65536 * 3, // objects
-        65536 * 3, // fields
-        65536 * 3, // strings
+        65536 * 16, // objects  (~1M)
+        65536 * 16, // fields   (~1M)
+        65536 * 16, // strings  (~1M)
       };
       auto t_deser0 = std::chrono::steady_clock::now();
       bool ok = serialization::load_t_from_binary(result_struct, epee::strspan<uint8_t>(*body_ptr), &default_http_bin_limits);
       auto t_deser1 = std::chrono::steady_clock::now();
 
-      // Compact PERF log covering entire HTTP cycle
-      MWARNING("PERF invoke_http_bin uri=" << uri
+      // Compact PERF log covering entire HTTP cycle. Request-id + epoch timestamps allow
+      // cross-machine correlation with the server's [PERF RPC] logs. Explicit "global"
+      // category because wallet2.cpp's translation unit defines MONERO_DEFAULT_LOG_CATEGORY
+      // as "wallet.wallet2" but this header may be included from other units where the
+      // category is filtered (e.g. net.http:FATAL blocks everything http-ish).
+      MCWARNING("global", "PERF invoke_http_bin id=" << perf_req_id
+        << " uri=" << uri
+        << " send_epoch_ms=" << t_send_epoch_ms
+        << " recv_epoch_ms=" << t_recv_epoch_ms
         << " req_bytes=" << req_size
         << " http_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_http1 - t_http0).count()
         << " raw_resp_bytes=" << raw_size
