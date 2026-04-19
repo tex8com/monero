@@ -1459,6 +1459,21 @@ bool wallet2::init(std::string daemon_address, boost::optional<epee::net_utils::
   m_checkpoints.init_default_checkpoints(m_nettype);
   m_is_initialized = true;
   m_upper_transaction_weight_limit = upper_transaction_weight_limit;
+
+#ifdef MONERO_GRPC_STREAM
+  // Env-var fallback: if the caller hasn't set an endpoint explicitly via
+  // set_grpc_stream_endpoint(), honor CUPRATE_GRPC_ENDPOINT. Lets existing
+  // wallet binaries opt into streaming sync without code changes -- useful
+  // for testing before the GUI gets a proper settings UI.
+  if (m_grpc_stream_endpoint.empty())
+  {
+    if (const char* env = std::getenv("CUPRATE_GRPC_ENDPOINT"); env && *env)
+    {
+      set_grpc_stream_endpoint(env);
+    }
+  }
+#endif
+
   return set_daemon(daemon_address, daemon_login, trusted_daemon, std::move(ssl_options));
 }
 //----------------------------------------------------------------------------------------------------
