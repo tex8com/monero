@@ -3285,6 +3285,34 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
   if (m_grpc_stream_endpoint.empty() || m_grpc_stream_fallback_to_bin)
     return false;
 
+  // Open stream at the wallet's ACTUAL current position, not at the
+  // caller-supplied start_height. That param is the user's restore-from
+  // height (typically 0 or a birthday height from refresh()), while
+  // m_blockchain.size() is where we actually need blocks. With bin RPC
+  // the daemon resolves this ambiguity via short_chain_history; with a
+  // stream we have to pick one concrete starting height up front.
+  // Pick the max of the two so we never re-stream blocks we already have.
+  const uint64_t wallet_height = m_blockchain.size();
+  const uint64_t effective_start = std::max(start_height, wallet_height);
+
+  // If an old stream is open at a height that no longer matches where
+  // the wallet is (e.g. after a chain reorg truncated m_blockchain, or
+  // the caller moved back for a restore), close and reopen.
+  if (m_grpc_stream_active && m_grpc_stream_client)
+  {
+    const uint64_t next_expected = m_grpc_stream_client->last_chunk_start_height()
+                                 + m_grpc_stream_client->last_chunk_n_blocks();
+    if (next_expected != effective_start)
+    {
+      MWARNING("grpc_stream: expected next=" << next_expected
+        << " but wallet wants start=" << effective_start
+        << " (wallet_height=" << wallet_height
+        << " caller_start=" << start_height << ") -- reopening stream");
+      m_grpc_stream_client->close();
+      m_grpc_stream_active = false;
+    }
+  }
+
   // Open stream on demand. One stream per refresh session, from the current
   // m_blockchain size onward; server streams until tip, then stream ends.
   if (!m_grpc_stream_active)
@@ -3300,16 +3328,14 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
       m_grpc_stream_fallback_to_bin = true;
       return false;
     }
-    // Generate a fresh session id so wallet and cuprated PERF logs line up
-    // for this refresh cycle even after a reconnect.
     std::ostringstream sid;
     sid << "wallet-" << std::chrono::system_clock::now().time_since_epoch().count()
-        << "-h" << start_height;
+        << "-h" << effective_start;
     m_grpc_stream_session_id = sid.str();
-    if (!m_grpc_stream_client->open_stream(start_height, /*stop=*/0, /*prune=*/true,
+    if (!m_grpc_stream_client->open_stream(effective_start, /*stop=*/0, /*prune=*/true,
         m_grpc_stream_chunk_hint, m_grpc_stream_session_id))
     {
-      MWARNING("grpc_stream: open_stream failed at start=" << start_height
+      MWARNING("grpc_stream: open_stream failed at start=" << effective_start
         << " err=" << m_grpc_stream_client->last_error_message()
         << " -- falling back to bin RPC for this iteration");
       return false;
