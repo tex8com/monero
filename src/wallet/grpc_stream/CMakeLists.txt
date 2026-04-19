@@ -66,15 +66,16 @@ target_include_directories(cuprate_grpc_stream
             ${PROTOBUF_INCLUDE_DIRS}
 )
 
+# INTERFACE so downstream targets (wallet, test exe) inherit the -L dirs too.
 target_link_directories(cuprate_grpc_stream
-    PRIVATE
+    PUBLIC
             ${GRPCPP_LIBRARY_DIRS}
             ${GRPC_LIBRARY_DIRS}
             ${PROTOBUF_LIBRARY_DIRS}
 )
 
 target_link_libraries(cuprate_grpc_stream
-    PRIVATE
+    PUBLIC
         ${GRPCPP_LIBRARIES}
         ${GRPC_LIBRARIES}
         ${PROTOBUF_LIBRARIES}
@@ -86,4 +87,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         PROPERTIES COMPILE_FLAGS
         "-Wno-unused-parameter -Wno-deprecated-declarations -Wno-unused-variable"
     )
+endif()
+
+# Optional standalone test tool — validates the client against a live cuprated
+# gRPC server without pulling in the full wallet translation unit. Default OFF.
+option(BUILD_GRPC_STREAM_TESTS "Build cuprate_grpc_stream_test smoke binary" OFF)
+if(BUILD_GRPC_STREAM_TESTS)
+    add_executable(cuprate_grpc_stream_test test_client.cpp)
+    set_target_properties(cuprate_grpc_stream_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+    target_link_libraries(cuprate_grpc_stream_test PRIVATE cuprate_grpc_stream)
 endif()
