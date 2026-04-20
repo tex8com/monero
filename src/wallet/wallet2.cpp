@@ -3285,38 +3285,24 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
   if (m_grpc_stream_endpoint.empty() || m_grpc_stream_fallback_to_bin)
     return false;
 
-  // Open stream at the wallet's ACTUAL current position, not at the
-  // caller-supplied start_height. That param is the user's restore-from
-  // height (typically 0 or a birthday height from refresh()), while
-  // m_blockchain.size() is where we actually need blocks. With bin RPC
-  // the daemon resolves this ambiguity via short_chain_history; with a
-  // stream we have to pick one concrete starting height up front.
-  // Pick the max of the two so we never re-stream blocks we already have.
-  const uint64_t wallet_height = m_blockchain.size();
-  const uint64_t effective_start = std::max(start_height, wallet_height);
-
-  // If an old stream is open at a height that no longer matches where
-  // the wallet is (e.g. after a chain reorg truncated m_blockchain, or
-  // the caller moved back for a restore), close and reopen.
-  if (m_grpc_stream_active && m_grpc_stream_client)
-  {
-    const uint64_t next_expected = m_grpc_stream_client->last_chunk_start_height()
-                                 + m_grpc_stream_client->last_chunk_n_blocks();
-    if (next_expected != effective_start)
-    {
-      MWARNING("grpc_stream: expected next=" << next_expected
-        << " but wallet wants start=" << effective_start
-        << " (wallet_height=" << wallet_height
-        << " caller_start=" << start_height << ") -- reopening stream");
-      m_grpc_stream_client->close();
-      m_grpc_stream_active = false;
-    }
-  }
-
-  // Open stream on demand. One stream per refresh session, from the current
-  // m_blockchain size onward; server streams until tip, then stream ends.
+  // Stream is linear and self-synchronising: once open, just keep popping
+  // chunks in order. We do NOT compare to m_blockchain.size() here —
+  // pull_blocks runs CONCURRENTLY with process_parsed_blocks on the main
+  // thread (see pull_and_parse_next_blocks' tpool.submit), so reading
+  // m_blockchain.size() inside the pull task would see a stale value (the
+  // value before the currently-processing chunk is applied). That mismatch
+  // was causing a false "reopen stream" every iteration, throwing away
+  // 999/1000 of each chunk and collapsing throughput to a single block
+  // per round-trip.
+  //
+  // Only open on first call and on hard stream failure below.
   if (!m_grpc_stream_active)
   {
+    // Open at max(caller start_height, m_blockchain.size()) — the max
+    // handles both restore-from-height (caller passes user's birthday)
+    // and continuation from current sync point. Only reached when no
+    // stream is live, so the concurrency issue above does not apply.
+    const uint64_t effective_start = std::max(start_height, static_cast<uint64_t>(m_blockchain.size()));
     if (!m_grpc_stream_client)
       m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
     m_grpc_stream_client->close();
@@ -3344,7 +3330,11 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
   }
 
   std::string payload;
-  if (!m_grpc_stream_client->next_chunk_payload(payload, 60000))
+  const auto t_pop0 = std::chrono::steady_clock::now();
+  const bool pop_ok = m_grpc_stream_client->next_chunk_payload(payload, 60000);
+  const double pop_wait_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_pop0).count();
+  if (!pop_ok)
   {
     // End-of-stream (tip reached) OR timeout OR error. Close and let
     // caller fall back to bin RPC for this call. Next refresh cycle opens
@@ -3385,10 +3375,42 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
     return false;
   }
 
+  // Detect "stream drifted behind wallet" — happens when the wallet's state
+  // advanced via another path (bin RPC first-pull overlap, or a previous
+  // pull that added blocks past the stream's open point). If the entire
+  // popped chunk sits below the wallet's current tip, every block is a
+  // duplicate and chain-integration rejects the batch (blocks_added=0).
+  // We then need to close the stream and reopen at the wallet's actual
+  // current tip so subsequent chunks are fresh.
+  const uint64_t chunk_end_exclusive = res.start_height + res.blocks.size();
+  const uint64_t wallet_tip = m_blockchain.size();
+  if (chunk_end_exclusive <= wallet_tip)
+  {
+    MWARNING("grpc_stream: popped chunk [" << res.start_height << ".."
+      << chunk_end_exclusive << ") is entirely behind wallet tip=" << wallet_tip
+      << " -- stream drifted; closing for reopen at current tip");
+    m_grpc_stream_client->close();
+    m_grpc_stream_active = false;
+    return false;  // caller falls back to bin RPC for this iter;
+                   // next iter reopens the stream at the new wallet tip
+  }
+
   blocks_start_height = res.start_height;
   blocks = std::move(res.blocks);
   o_indices = std::move(res.output_indices);
   current_height = res.current_height;
+
+  // Two-sided bottleneck signal:
+  //   pop_wait_ms high  -> we blocked waiting for the next chunk => stream is
+  //                        the bottleneck (server slow OR network slow)
+  //   pop_wait_ms ~0    -> chunk was already sitting in the queue => wallet
+  //                        is the bottleneck (scan/process slower than stream)
+  MWARNING("PERF grpc pull: start=" << blocks_start_height
+      << " blocks=" << blocks.size()
+      << " payload_bytes=" << payload.size()
+      << " pop_wait_ms=" << pop_wait_ms
+      << " tip=" << current_height
+      << " session=" << m_grpc_stream_session_id);
   return true;
 }
 #endif
