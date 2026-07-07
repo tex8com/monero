@@ -14,11 +14,15 @@
 // instead of bloating memory.
 
 #include "grpc_block_stream_client.h"
+#include "grpc_stream_status.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -26,13 +30,42 @@
 #include <thread>
 #include <utility>
 
+#include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/grpcpp.h>
 #include "cuprate_stream.grpc.pb.h"
 
 namespace cuprate_grpc_stream {
 
+std::atomic<int64_t>& last_successful_chunk_unix_ms()
+{
+    static std::atomic<int64_t> s_last{0};
+    return s_last;
+}
+
 namespace {
-    constexpr size_t QUEUE_CAPACITY = 4;
+    constexpr size_t DEFAULT_QUEUE_CAPACITY = 32;
+    constexpr size_t MAX_QUEUE_CAPACITY = 128;
+    constexpr int MAX_GRPC_MESSAGE_BYTES = 1024 * 1024 * 1024;
+    constexpr int GRPC_HTTP2_BUFFER_BYTES = 64 * 1024 * 1024;
+    constexpr int GRPC_HTTP2_MAX_FRAME_BYTES = 16 * 1024 * 1024 - 1;
+
+    size_t queue_capacity()
+    {
+        static const size_t cap = []() -> size_t {
+            const char *env = std::getenv("CUPRATE_GRPC_QUEUE_CAPACITY");
+            if (!env || !*env)
+                return DEFAULT_QUEUE_CAPACITY;
+
+            errno = 0;
+            char *endptr = nullptr;
+            const unsigned long parsed = std::strtoul(env, &endptr, 10);
+            if (errno != 0 || !endptr || *endptr != '\0' || parsed == 0)
+                return DEFAULT_QUEUE_CAPACITY;
+
+            return static_cast<size_t>(std::max(1UL, std::min(parsed, static_cast<unsigned long>(MAX_QUEUE_CAPACITY))));
+        }();
+        return cap;
+    }
 }
 
 struct chunk_record {
@@ -98,13 +131,21 @@ bool cuprate_grpc_stream_client::connect(const std::string& target)
         return false;
     }
     grpc::ChannelArguments ch_args;
-    ch_args.SetMaxReceiveMessageSize(64 * 1024 * 1024);
-    ch_args.SetMaxSendMessageSize(64 * 1024 * 1024);
+    ch_args.SetMaxReceiveMessageSize(MAX_GRPC_MESSAGE_BYTES);
+    ch_args.SetMaxSendMessageSize(MAX_GRPC_MESSAGE_BYTES);
+    ch_args.SetInt(GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES, GRPC_HTTP2_BUFFER_BYTES);
+    ch_args.SetInt(GRPC_ARG_HTTP2_WRITE_BUFFER_SIZE, GRPC_HTTP2_BUFFER_BYTES);
+    ch_args.SetInt(GRPC_ARG_HTTP2_MAX_FRAME_SIZE, GRPC_HTTP2_MAX_FRAME_BYTES);
+    ch_args.SetInt(GRPC_ARG_HTTP2_BDP_PROBE, 1);
     p_->channel = grpc::CreateCustomChannel(target, grpc::InsecureChannelCredentials(), ch_args);
     p_->stub = cuprate::stream::v1::BlockStream::NewStub(p_->channel);
     std::fprintf(stderr,
-        "[GRPC client] CONNECT target=%s (channel created -- gRPC connect is lazy, first RPC opens TCP)\n",
-        target.c_str());
+        "[GRPC client] CONNECT target=%s queue_capacity=%zu max_msg=%d http2_buffer=%d max_frame=%d (channel created -- gRPC connect is lazy, first RPC opens TCP)\n",
+        target.c_str(),
+        queue_capacity(),
+        MAX_GRPC_MESSAGE_BYTES,
+        GRPC_HTTP2_BUFFER_BYTES,
+        GRPC_HTTP2_MAX_FRAME_BYTES);
     return true;
 }
 
@@ -185,7 +226,7 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
             std::unique_lock<std::mutex> lk(p_->mu);
             const auto t_enq0 = std::chrono::steady_clock::now();
             p_->cv_not_full.wait(lk, [this]() {
-                return p_->queue.size() < QUEUE_CAPACITY || p_->cancelled;
+                return p_->queue.size() < queue_capacity() || p_->cancelled;
             });
             const double enq_wait_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_enq0).count();
@@ -227,6 +268,11 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
 
             p_->queue.push_back(std::move(rec));
             lk.unlock();
+            // Publish liveness timestamp read by the Qt GUI badge.
+            last_successful_chunk_unix_ms().store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
             p_->cv_not_empty.notify_one();
         }
 

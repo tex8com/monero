@@ -52,7 +52,7 @@ public:
     // successful stream open. Pass stop_height = 0 to stream until tip.
     //
     // `chunk_blocks_hint` follows the proto contract — server clamps to
-    // [16, 2000]. Sweet spot per smoke tests: 1000.
+    // [16, 10000]. For high-throughput tests use CUPRATE_GRPC_CHUNK_HINT=10000.
     //
     // `client_request_id` is echoed in the cuprated [GRPC StreamBlocks] log
     // line of every chunk — pass a per-sync-session id so wallet logs and

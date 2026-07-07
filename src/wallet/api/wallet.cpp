@@ -996,6 +996,24 @@ bool WalletImpl::init(const std::string &daemon_address, uint64_t upper_transact
     return doInit(daemon_address, proxy_address, upper_transaction_size_limit, use_ssl);
 }
 
+void WalletImpl::setGrpcStreamEndpoint(const std::string &endpoint)
+{
+#ifdef MONERO_GRPC_STREAM
+    m_wallet->set_grpc_stream_endpoint(endpoint);
+#else
+    (void)endpoint;
+#endif
+}
+
+std::string WalletImpl::grpcStreamEndpoint() const
+{
+#ifdef MONERO_GRPC_STREAM
+    return m_wallet->get_grpc_stream_endpoint();
+#else
+    return {};
+#endif
+}
+
 bool WalletImpl::lightWalletLogin(bool &isNewWallet) const
 {
   return m_wallet->light_wallet_login(isNewWallet);

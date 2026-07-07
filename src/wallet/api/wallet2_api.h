@@ -554,6 +554,18 @@ struct Wallet
      */
     virtual bool init(const std::string &daemon_address, uint64_t upper_transaction_size_limit = 0, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") = 0;
 
+    /*!
+     * \brief setGrpcStreamEndpoint - enables/disables the forked Cuprate gRPC
+     * streaming sync endpoint when the wallet core was built with
+     * MONERO_GRPC_STREAM. Passing an empty string disables streaming sync.
+     */
+    virtual void setGrpcStreamEndpoint(const std::string &endpoint) = 0;
+
+    /*!
+     * \brief grpcStreamEndpoint - returns the configured Cuprate gRPC stream endpoint.
+     */
+    virtual std::string grpcStreamEndpoint() const = 0;
+
    /*!
     * \brief createWatchOnly - Creates a watch only wallet
     * \param path - where to store the wallet
