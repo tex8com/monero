@@ -21,6 +21,9 @@ pkg_check_modules(PROTOBUF REQUIRED protobuf)
 if(NOT DEFINED GRPC_CPP_PLUGIN_PATH)
     find_program(GRPC_CPP_PLUGIN_PATH grpc_cpp_plugin REQUIRED)
 endif()
+if(NOT DEFINED PROTOC_PATH)
+    find_program(PROTOC_PATH protoc REQUIRED)
+endif()
 
 set(PROTO_FILE  "${CMAKE_CURRENT_SOURCE_DIR}/cuprate_stream.proto")
 set(PROTO_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen")
@@ -35,7 +38,7 @@ set(GENERATED_PB
 
 add_custom_command(
     OUTPUT ${GENERATED_PB}
-    COMMAND protoc
+    COMMAND ${PROTOC_PATH}
         --proto_path=${CMAKE_CURRENT_SOURCE_DIR}
         --cpp_out=${PROTO_OUT_DIR}
         --grpc_out=${PROTO_OUT_DIR}

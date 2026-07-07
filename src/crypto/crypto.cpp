@@ -42,12 +42,9 @@
 #include "warnings.h"
 #include "crypto.h"
 #include "hash.h"
+#include "monero_fast_crypto.h"
 
 #include "cryptonote_config.h"
-
-extern "C" {
-  int fast_generate_key_derivation(uint8_t *result, const uint8_t *scalar, const uint8_t *point);
-}
 
 namespace {
   static void local_abort(const char *msg)

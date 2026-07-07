@@ -54,7 +54,23 @@ if(ARCH_ID STREQUAL "i386" OR ARCH_ID STREQUAL "x86_64" OR ARCH_ID STREQUAL "x86
 list(APPEND crypto_sources CryptonightR_template.S)
 endif()
 
-include_directories(${RANDOMX_INCLUDE})
+set(
+  MONERO_FAST_CRYPTO_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../external/monero-fast-crypto/include"
+  CACHE PATH
+  "Path to monero-fast-crypto headers"
+)
+
+set(
+  MONERO_FAST_CRYPTO_LIBRARY
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../external/monero-fast-crypto/target/release/libmonero_fast_crypto.a"
+  CACHE FILEPATH
+  "Path to the target-specific monero-fast-crypto static library"
+)
+
+include_directories(
+  ${RANDOMX_INCLUDE}
+  "${MONERO_FAST_CRYPTO_INCLUDE_DIR}")
 
 set(crypto_headers)
 
@@ -66,8 +82,8 @@ monero_add_library(cncrypto
   ${crypto_sources}
   ${crypto_headers}
   ${crypto_private_headers})
-# curve25519-dalek fast crypto (Rust static library)
-set(FAST_CRYPTO_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../external/monero-fast-crypto/target/release/libmonero_fast_crypto.a")
+
+message(STATUS "Using monero-fast-crypto library: ${MONERO_FAST_CRYPTO_LIBRARY}")
 
 target_link_libraries(cncrypto
   PUBLIC
@@ -75,7 +91,7 @@ target_link_libraries(cncrypto
     randomx
     ${Boost_SYSTEM_LIBRARY}
     ${SODIUM_LIBRARY}
-    ${FAST_CRYPTO_LIB}
+    ${MONERO_FAST_CRYPTO_LIBRARY}
   PRIVATE
     ${EXTRA_LIBRARIES})
 

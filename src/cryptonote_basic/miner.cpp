@@ -46,13 +46,15 @@
 #include <boost/filesystem.hpp>
 
 #ifdef __APPLE__
+  #include <TargetConditionals.h>
   #include <sys/times.h>
-  #include <IOKit/IOKitLib.h>
-  #include <IOKit/ps/IOPSKeys.h>
-  #include <IOKit/ps/IOPowerSources.h>
   #include <mach/mach_host.h>
   #include <AvailabilityMacros.h>
-  #include <TargetConditionals.h>
+  #if !TARGET_OS_IPHONE
+    #include <IOKit/IOKitLib.h>
+    #include <IOKit/ps/IOPSKeys.h>
+    #include <IOKit/ps/IOPowerSources.h>
+  #endif
 #elif defined(__linux__)
   #include <unistd.h>
   #include <sys/resource.h>
@@ -980,7 +982,7 @@ namespace cryptonote
 
     #elif defined(__APPLE__) 
       
-      #if TARGET_OS_MAC && (!defined(MAC_OS_X_VERSION_MIN_REQUIRED) || MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_X_VERSION_10_7)
+      #if !TARGET_OS_IPHONE && TARGET_OS_MAC && (!defined(MAC_OS_X_VERSION_MIN_REQUIRED) || MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_X_VERSION_10_7)
         return boost::logic::tribool(IOPSGetTimeRemainingEstimate() != kIOPSTimeRemainingUnlimited);
       #else
         // iOS or OSX <10.7
