@@ -29,7 +29,9 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <numeric>
 #include <tuple>
@@ -1440,6 +1442,7 @@ bool wallet2::set_proxy(const std::string &address)
 #ifdef MONERO_GRPC_STREAM
 void wallet2::set_grpc_stream_endpoint(const std::string &endpoint)
 {
+  m_grpc_stream_endpoint_explicitly_set = true;
   // Close any in-flight stream first (idempotent if none).
   if (m_grpc_stream_client)
     m_grpc_stream_client->close();
@@ -1461,13 +1464,35 @@ bool wallet2::init(std::string daemon_address, boost::optional<epee::net_utils::
   m_upper_transaction_weight_limit = upper_transaction_weight_limit;
 
 #ifdef MONERO_GRPC_STREAM
+  if (const char *chunk_hint_env = std::getenv("CUPRATE_GRPC_CHUNK_HINT"))
+  {
+    if (*chunk_hint_env)
+    {
+      errno = 0;
+      char *endptr = nullptr;
+      const unsigned long parsed = std::strtoul(chunk_hint_env, &endptr, 10);
+      if (errno == 0 && endptr && *endptr == '\0')
+      {
+        const unsigned long clamped = std::max(16UL, std::min(parsed, 10000UL));
+        m_grpc_stream_chunk_hint = static_cast<uint32_t>(clamped);
+        MWARNING("grpc_stream chunk hint set to " << m_grpc_stream_chunk_hint
+          << " from CUPRATE_GRPC_CHUNK_HINT='" << chunk_hint_env << "'");
+      }
+      else
+      {
+        MWARNING("grpc_stream ignoring invalid CUPRATE_GRPC_CHUNK_HINT='"
+          << chunk_hint_env << "'");
+      }
+    }
+  }
+
   // Env-var fallback: if the caller hasn't set an endpoint explicitly via
   // set_grpc_stream_endpoint(), honor CUPRATE_GRPC_ENDPOINT. Lets existing
-  // wallet binaries opt into streaming sync without code changes -- useful
-  // for testing before the GUI gets a proper settings UI.
-  if (m_grpc_stream_endpoint.empty())
+  // CLI/test binaries opt into streaming sync without code changes.
+  if (!m_grpc_stream_endpoint_explicitly_set && m_grpc_stream_endpoint.empty())
   {
-    if (const char* env = std::getenv("CUPRATE_GRPC_ENDPOINT"); env && *env)
+    const char* env = std::getenv("CUPRATE_GRPC_ENDPOINT");
+    if (env && *env)
     {
       set_grpc_stream_endpoint(env);
     }
@@ -3277,7 +3302,7 @@ void wallet2::process_pool_info_extent(const cryptonote::COMMAND_RPC_GET_BLOCKS_
 }
 //----------------------------------------------------------------------------------------------------
 #ifdef MONERO_GRPC_STREAM
-bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start_height,
+bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height, uint64_t &blocks_start_height,
     std::vector<cryptonote::block_complete_entry> &blocks,
     std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices,
     uint64_t &current_height)
@@ -3298,11 +3323,15 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
   // Only open on first call and on hard stream failure below.
   if (!m_grpc_stream_active)
   {
-    // Open at max(caller start_height, m_blockchain.size()) — the max
-    // handles both restore-from-height (caller passes user's birthday)
-    // and continuation from current sync point. Only reached when no
-    // stream is live, so the concurrency issue above does not apply.
-    const uint64_t effective_start = std::max(start_height, static_cast<uint64_t>(m_blockchain.size()));
+    // Open at max(caller start_height, m_blockchain.size()) for continuation.
+    // On the first pull of a refresh there is no concurrent block-processing
+    // task yet, so keep the normal 1-block overlap that bin RPC gets through
+    // short_chain_history. That preserves split/reorg detection while still
+    // starting the block transport through gRPC immediately.
+    const uint64_t wallet_height = static_cast<uint64_t>(m_blockchain.size());
+    const uint64_t effective_start = first && wallet_height > 0
+      ? wallet_height - 1
+      : std::max(start_height, wallet_height);
     if (!m_grpc_stream_client)
       m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
     m_grpc_stream_client->close();
@@ -3384,15 +3413,23 @@ bool wallet2::try_pull_blocks_grpc(uint64_t start_height, uint64_t &blocks_start
   // current tip so subsequent chunks are fresh.
   const uint64_t chunk_end_exclusive = res.start_height + res.blocks.size();
   const uint64_t wallet_tip = m_blockchain.size();
-  if (chunk_end_exclusive <= wallet_tip)
+  // Drift heuristic with large tolerance. m_blockchain.size() is read from the
+  // pull-task thread while the main thread may be committing a prior batch,
+  // so small skew (up to one batch ~= 1000 blocks) is normal and must NOT
+  // trigger a reopen -- doing so loses ~2.5s of server warmup per false
+  // positive. Only reopen when the chunk is *clearly* way behind the wallet,
+  // which happens only on genuine state drift (e.g. wallet advanced via a
+  // separate bin-RPC path while the stream was stuck).
+  constexpr uint64_t DRIFT_TOLERANCE = 5000;
+  if (chunk_end_exclusive + DRIFT_TOLERANCE <= wallet_tip)
   {
     MWARNING("grpc_stream: popped chunk [" << res.start_height << ".."
-      << chunk_end_exclusive << ") is entirely behind wallet tip=" << wallet_tip
-      << " -- stream drifted; closing for reopen at current tip");
+      << chunk_end_exclusive << ") is >" << DRIFT_TOLERANCE
+      << " blocks behind wallet tip=" << wallet_tip
+      << " -- genuine stream drift; closing for reopen at current tip");
     m_grpc_stream_client->close();
     m_grpc_stream_active = false;
-    return false;  // caller falls back to bin RPC for this iter;
-                   // next iter reopens the stream at the new wallet tip
+    return false;
   }
 
   blocks_start_height = res.start_height;
@@ -3422,18 +3459,30 @@ void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_heigh
   // if the endpoint is unset, the stream errored, or end-of-stream is hit
   // (next refresh cycle will reopen).
   //
-  // `first` stays on bin-RPC because that call also requests the mempool
-  // snapshot (requested_info = BLOCKS_AND_POOL), which the stream does not
-  // carry. m_background_syncing deliberately DOES NOT gate here — view-only
-  // Ledger wallets are permanently in background-sync mode and still want
-  // the stream; background sync only affects wallet-side key-image logic,
-  // not the daemon block-transport path.
+  // The first refresh pull starts with gRPC too. The stream carries blocks
+  // only, so when that first gRPC pull succeeds we refresh the tx pool through
+  // the normal RPC pool path below before returning. m_background_syncing
+  // deliberately DOES NOT gate here — view-only Ledger wallets are permanently
+  // in background-sync mode and still want the stream; background sync only
+  // affects wallet-side key-image logic, not the daemon block-transport path.
   if (!m_grpc_stream_endpoint.empty()
-      && !m_grpc_stream_fallback_to_bin
-      && !first)
+      && !m_grpc_stream_fallback_to_bin)
   {
-    if (try_pull_blocks_grpc(start_height, blocks_start_height, blocks, o_indices, current_height))
+    if (try_pull_blocks_grpc(first, start_height, blocks_start_height, blocks, o_indices, current_height))
     {
+      if (first && !m_background_syncing)
+      {
+        MWARNING("grpc_stream: first pull used gRPC; updating tx pool via RPC");
+        try
+        {
+          update_pool_state(m_process_pool_txs, true, try_incremental);
+        }
+        catch (const std::exception &e)
+        {
+          MWARNING("grpc_stream: tx pool update after first gRPC pull failed: "
+            << e.what() << " -- keeping gRPC block batch");
+        }
+      }
       MWARNING("PERF pull_blocks via gRPC stream: start=" << blocks_start_height
         << " count=" << blocks.size() << " tip=" << current_height);
       return;
@@ -3619,12 +3668,14 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
   blocks_added = 0;
 
   THROW_WALLET_EXCEPTION_IF(blocks.size() != parsed_blocks.size(), error::wallet_internal_error, "size mismatch");
-  if (!m_blockchain.is_in_bounds(current_index))
+  const bool appending_at_tip = current_index == m_blockchain.size();
+  if (!appending_at_tip && !m_blockchain.is_in_bounds(current_index))
   {
     MWARNING("PERF HASHCHAIN_BOUNDS_FAIL start_height=" << start_height
       << " current_index=" << current_index
       << " m_blockchain.size=" << m_blockchain.size()
       << " m_blockchain.offset=" << m_blockchain.offset()
+      << " appending_at_tip=" << appending_at_tip
       << " blocks=" << blocks.size());
     THROW_WALLET_EXCEPTION(error::out_of_hashchain_bounds_error);
   }
@@ -3685,16 +3736,22 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
     }
   };
 
-  for (size_t i = 0; i < tx_cache_data.size(); ++i)
+  constexpr size_t DERIVATION_BATCH_SIZE = 100;
+  for (size_t batch_start = 0; batch_start < tx_cache_data.size(); batch_start += DERIVATION_BATCH_SIZE)
   {
-    if (tx_cache_data[i].empty())
-      continue;
-    tpool.submit(&waiter, [&gender, &tx_cache_data, i]() {
-      auto &slot = tx_cache_data[i];
-      for (auto &iod: slot.primary)
-        gender(iod);
-      for (auto &iod: slot.additional)
-        gender(iod);
+    const size_t batch_end = std::min(batch_start + DERIVATION_BATCH_SIZE, tx_cache_data.size());
+    THROW_WALLET_EXCEPTION_IF(batch_end < batch_start, error::wallet_internal_error, "Derivation batch end overflow");
+    tpool.submit(&waiter, [&gender, &tx_cache_data, batch_start, batch_end]() {
+      for (size_t i = batch_start; i < batch_end; ++i)
+      {
+        auto &slot = tx_cache_data[i];
+        if (slot.empty())
+          continue;
+        for (auto &iod: slot.primary)
+          gender(iod);
+        for (auto &iod: slot.additional)
+          gender(iod);
+      }
     }, true);
   }
   THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
@@ -4909,11 +4966,18 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
         m_node_rpc_proxy.set_height(m_blockchain.size());
         break;
       }
+      static std::chrono::steady_clock::time_point s_last_iter_end_tp{};
+      const auto t_iter_begin = std::chrono::steady_clock::now();
+      const int64_t inter_iter_idle_ms = (s_last_iter_end_tp.time_since_epoch().count() == 0) ? 0 :
+          std::chrono::duration_cast<std::chrono::milliseconds>(t_iter_begin - s_last_iter_end_tp).count();
       MWARNING("PERF refresh_iter#" << iter_count << " BEGIN first=" << first << " last=" << last
         << " blocks_fetched=" << blocks_fetched
         << " m_blockchain.size=" << m_blockchain.size()
-        << " blocks_pending_processing=" << blocks.size());
+        << " blocks_pending_processing=" << blocks.size()
+        << " inter_iter_idle_ms=" << inter_iter_idle_ms);
       auto t_submit0 = std::chrono::steady_clock::now();
+      std::chrono::steady_clock::time_point t1_proc_for_log = t_submit0;
+      int64_t proc_ms_for_log = 0;
       if (!last)
       {
         // Capture prev blocks_start_height by value for speculative prefetch.
@@ -4928,10 +4992,10 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
         {
           auto t0_proc = std::chrono::steady_clock::now();
           process_parsed_blocks(blocks_start_height, blocks, parsed_blocks, added_blocks, output_tracker_cache.get());
-          auto t1_proc = std::chrono::steady_clock::now();
+          t1_proc_for_log = std::chrono::steady_clock::now();
+          proc_ms_for_log = std::chrono::duration_cast<std::chrono::milliseconds>(t1_proc_for_log - t0_proc).count();
           MWARNING("PERF refresh_iter#" << iter_count << " process_parsed_blocks wrapper: "
-            << blocks.size() << " blocks in "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(t1_proc - t0_proc).count() << "ms");
+            << blocks.size() << " blocks in " << proc_ms_for_log << "ms");
         }
         catch (const tools::error::out_of_hashchain_bounds_error&)
         {
@@ -4988,13 +5052,74 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
         }
         catch (const std::exception &e)
         {
-          MERROR("Error parsing blocks: " << e.what());
+          const std::string msg = e.what();
+          // Chain-split recovery: daemon's block at our recorded height has a
+          // different hash than what m_blockchain stored. Happens when the
+          // wallet was synced earlier against a different node / fork state
+          // whose hashes diverged from the current daemon's view. The GUI's
+          // soft "Rescan Wallet Blockchain" does NOT truncate m_blockchain,
+          // so the same split keeps retriggering forever.
+          //
+          // Hard recovery: wipe m_blockchain back to genesis and restart the
+          // refresh from scratch. The next fast_refresh rebuilds the hash
+          // chain from the current daemon, so the split goes away on first
+          // try. Keys and transfer data are untouched.
+          if (msg.find("split starts from the first block in response") != std::string::npos)
+          {
+            MWARNING("PERF CHAIN_SPLIT recovery: detected persistent split, "
+              << "wiping m_blockchain to genesis for hard resync. "
+              << "m_blockchain.size=" << m_blockchain.size()
+              << " msg='" << msg << "'");
+
+            // CRITICAL: join the async pull-task FIRST. worker threads in
+            // pull_and_parse_next_blocks are still referencing `blocks` and
+            // `parsed_blocks` at this point; clearing under their feet is a
+            // use-after-free and crashes in tx deserialization (seen: SIGSEGV
+            // in cryptonote::transaction_prefix::member_do_serialize).
+            // waiter.wait() blocks until all submitted tasks return — the
+            // tasks themselves may throw (same split error), which is fine;
+            // we ignore their result here because we're throwing away the
+            // buffers anyway.
+            try { (void)waiter.wait(); } catch (...) {}
+
+            cryptonote::block genesis;
+            generate_genesis(genesis);
+            m_blockchain.clear();
+            m_blockchain.push_back(get_block_hash(genesis));
+            short_chain_history.clear();
+            get_short_chain_history(short_chain_history);
+            start_height = 0;
+            first = true;
+            blocks.clear();
+            parsed_blocks.clear();
+            next_blocks.clear();
+            next_parsed_blocks.clear();
+#ifdef MONERO_GRPC_STREAM
+            if (m_grpc_stream_client)
+              m_grpc_stream_client->close();
+            m_grpc_stream_active = false;
+            m_grpc_stream_fallback_to_bin = false;
+#endif
+            throw std::runtime_error(""); // loop again, fast_refresh rebuilds the chain
+          }
+          MERROR("Error parsing blocks: " << msg);
           exception = std::current_exception();
           error = true;
         }
         blocks_fetched += added_blocks;
       }
+      const auto t_wait0 = std::chrono::steady_clock::now();
       THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+      const auto t_wait1 = std::chrono::steady_clock::now();
+      const int64_t waiter_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_wait1 - t_wait0).count();
+      // Bottleneck signal from waiter_wait_ms:
+      //   large  -> main thread (scan) finished BEFORE pull task -> pull/network is the bottleneck
+      //   ~0     -> pull finished before scan -> scan is the bottleneck (pull threads idle waiting)
+      // Compare with proc_ms_for_log for ratio.
+      MWARNING("PERF refresh_iter#" << iter_count << " pipeline: proc_ms=" << proc_ms_for_log
+        << " waiter_wait_ms=" << waiter_wait_ms
+        << " bound=" << (waiter_wait_ms > proc_ms_for_log ? "NETWORK" : "SCAN")
+        << " overlap_ratio=" << (proc_ms_for_log == 0 ? 0.0 : static_cast<double>(proc_ms_for_log) / (proc_ms_for_log + waiter_wait_ms)));
 
       // handle error from async fetching thread
       if (error)
@@ -5025,6 +5150,7 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
       blocks = std::move(next_blocks);
       parsed_blocks = std::move(next_parsed_blocks);
       auto t_iter1 = std::chrono::steady_clock::now();
+      s_last_iter_end_tp = t_iter1;
       MWARNING("PERF refresh_iter#" << iter_count << " END in "
         << std::chrono::duration_cast<std::chrono::milliseconds>(t_iter1 - t_iter0).count() << "ms"
         << " blocks_fetched=" << blocks_fetched
