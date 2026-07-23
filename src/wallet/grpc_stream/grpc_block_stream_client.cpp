@@ -153,7 +153,8 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
                                              uint64_t stop_height,
                                              bool prune,
                                              uint32_t chunk_blocks_hint,
-                                             const std::string& client_request_id)
+                                             const std::string& client_request_id,
+                                             const std::vector<std::string>& chain_locator)
 {
     if (!p_->stub) {
         p_->last_error_code = -1;
@@ -186,17 +187,20 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
     req.set_chunk_blocks_hint(chunk_blocks_hint);
     req.set_no_miner_tx(false);
     req.set_client_request_id(client_request_id);
+    for (const std::string& hash : chain_locator)
+        req.add_chain_locator(hash);
 
     p_->ctx = std::make_unique<grpc::ClientContext>();
     p_->reader = p_->stub->StreamBlocks(p_->ctx.get(), req);
 
     std::fprintf(stderr,
-        "[GRPC client] OPEN client_req_id=%s start=%llu stop=%llu prune=%d chunk_hint=%u\n",
+        "[GRPC client] OPEN client_req_id=%s start=%llu stop=%llu prune=%d chunk_hint=%u locator_hashes=%zu\n",
         client_request_id.c_str(),
         (unsigned long long)start_height,
         (unsigned long long)stop_height,
         prune ? 1 : 0,
-        chunk_blocks_hint);
+        chunk_blocks_hint,
+        chain_locator.size());
 
     p_->recv_thread = std::thread([this]() {
         cuprate::stream::v1::BlockChunk chunk;
