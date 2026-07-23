@@ -37,6 +37,8 @@
 #include <boost/thread/locks.hpp> 
 #include <boost/thread/lock_guard.hpp>
 
+#include <mutex>
+
 namespace hw {
 
   namespace ledger {
@@ -52,6 +54,34 @@ namespace hw {
 
     void set_apdu_verbose(bool verbose) {
       apdu_verbose = verbose;
+    }
+
+    namespace {
+      std::mutex ble_transport_mutex;
+      ble_transport_callbacks registered_ble_transport;
+
+      ble_transport_callbacks get_ble_transport_callbacks() {
+        std::lock_guard<std::mutex> lock(ble_transport_mutex);
+        return registered_ble_transport;
+      }
+    }
+
+    void set_ble_transport_callbacks(const ble_transport_callbacks &callbacks) {
+      std::lock_guard<std::mutex> lock(ble_transport_mutex);
+      registered_ble_transport = callbacks;
+    }
+
+    void clear_ble_transport_callbacks() {
+      std::lock_guard<std::mutex> lock(ble_transport_mutex);
+      registered_ble_transport = {};
+    }
+
+    bool ble_transport_available() {
+      const auto callbacks = get_ble_transport_callbacks();
+      return callbacks.connect != nullptr &&
+             callbacks.disconnect != nullptr &&
+             callbacks.connected != nullptr &&
+             callbacks.exchange != nullptr;
     }
 
     #define TRACKD MTRACE("hw")
@@ -297,7 +327,11 @@ namespace hw {
     #define INS_GET_RESPONSE                    0xc0
 
 
-    device_ledger::device_ledger(): hw_device(0x0101, 0x05, 64, 2000) {
+    device_ledger::device_ledger()
+    #if defined(HAVE_HIDAPI)
+      : hw_device(0x0101, 0x05, 64, 2000)
+    #endif
+    {
       this->id = device_id++;
       this->reset_buffer();      
       this->mode = NONE;
@@ -458,7 +492,7 @@ namespace hw {
     unsigned int device_ledger::exchange(unsigned int ok, unsigned int mask) {
       logCMD();
 
-      this->length_recv =  hw_device.exchange(this->buffer_send, this->length_send, this->buffer_recv, BUFFER_SEND_SIZE, false);
+      this->length_recv = transport_exchange(false);
       ASSERT_X(this->length_recv>=2, "Communication error, less than tow bytes received");
 
       this->length_recv -= 2;
@@ -475,7 +509,7 @@ namespace hw {
     unsigned int device_ledger::exchange_wait_on_input(unsigned int ok, unsigned int mask) {
       logCMD();
       unsigned int deny = 0;
-      this->length_recv =  hw_device.exchange(this->buffer_send, this->length_send, this->buffer_recv, BUFFER_SEND_SIZE, true);
+      this->length_recv = transport_exchange(true);
       ASSERT_X(this->length_recv>=2, "Communication error, less than two bytes received");
 
       this->length_recv -= 2;
@@ -514,14 +548,7 @@ namespace hw {
       return this->name;
     }
 
-    bool device_ledger::init(void) {
-      this->controle_device = &hw::get_device("default");
-      this->release();
-      hw_device.init();      
-      MDEBUG( "Device "<<this->id <<" HIDUSB inited");
-      return true;
-    }
-    
+    #if defined(HAVE_HIDAPI)
     static const std::vector<hw::io::hid_conn_params> known_devices {
         {0x2c97, 0x0001, 0, 0xffa0}, 
         {0x2c97, 0x0004, 0, 0xffa0},       
@@ -530,10 +557,104 @@ namespace hw {
         {0x2c97, 0x0007, 0, 0xffa0},
         {0x2c97, 0x0008, 0, 0xffa0},
     };
+    #endif
+
+    bool device_ledger::wants_ble_transport() const {
+      return this->name.find(":ble") != std::string::npos;
+    }
+
+    bool device_ledger::transport_connect() {
+      if (!wants_ble_transport()) {
+      #if defined(HAVE_HIDAPI)
+        hw_device.connect(known_devices);
+        return true;
+      #else
+        ASSERT_X(false, "Ledger USB transport is unavailable in this build");
+      #endif
+      }
+
+      const auto callbacks = get_ble_transport_callbacks();
+      ASSERT_X(callbacks.connect != nullptr,
+               "Ledger BLE transport is unavailable on this platform");
+      return callbacks.connect(callbacks.context);
+    }
+
+    void device_ledger::transport_disconnect() {
+      if (!wants_ble_transport()) {
+      #if defined(HAVE_HIDAPI)
+        hw_device.disconnect();
+      #endif
+        return;
+      }
+
+      const auto callbacks = get_ble_transport_callbacks();
+      if (callbacks.disconnect != nullptr) {
+        callbacks.disconnect(callbacks.context);
+      }
+    }
+
+    bool device_ledger::transport_connected() const {
+      if (!wants_ble_transport()) {
+      #if defined(HAVE_HIDAPI)
+        return hw_device.connected();
+      #else
+        return false;
+      #endif
+      }
+
+      const auto callbacks = get_ble_transport_callbacks();
+      return callbacks.connected != nullptr && callbacks.connected(callbacks.context);
+    }
+
+    unsigned int device_ledger::transport_exchange(bool user_input) {
+      if (!wants_ble_transport()) {
+      #if defined(HAVE_HIDAPI)
+        return hw_device.exchange(this->buffer_send,
+                                  this->length_send,
+                                  this->buffer_recv,
+                                  BUFFER_RECV_SIZE,
+                                  user_input);
+      #else
+        ASSERT_X(false, "Ledger USB transport is unavailable in this build");
+      #endif
+      }
+
+      const auto callbacks = get_ble_transport_callbacks();
+      ASSERT_X(callbacks.exchange != nullptr,
+               "Ledger BLE transport is unavailable on this platform");
+      const int received = callbacks.exchange(callbacks.context,
+                                              this->buffer_send,
+                                              this->length_send,
+                                              this->buffer_recv,
+                                              BUFFER_RECV_SIZE,
+                                              user_input);
+      ASSERT_X(received >= 0, "Ledger BLE transport exchange failed");
+      ASSERT_X(static_cast<unsigned int>(received) <= BUFFER_RECV_SIZE,
+               "Ledger BLE transport returned an oversized response");
+      return static_cast<unsigned int>(received);
+    }
+
+    bool device_ledger::init(void) {
+      this->controle_device = &hw::get_device("default");
+      this->release();
+      if (!wants_ble_transport()) {
+      #if defined(HAVE_HIDAPI)
+        hw_device.init();
+        MDEBUG( "Device "<<this->id <<" HIDUSB inited");
+      #else
+        ASSERT_X(false, "Ledger USB transport is unavailable in this build");
+      #endif
+      } else {
+        ASSERT_X(ble_transport_available(),
+                 "Ledger BLE transport is unavailable on this platform");
+        MDEBUG( "Device "<<this->id <<" BLE transport inited");
+      }
+      return true;
+    }
 
     bool device_ledger::connect(void) {
       this->disconnect();
-      hw_device.connect(known_devices);
+      ASSERT_X(this->transport_connect(), "Unable to connect to Ledger device");
       this->reset();
       #ifdef DEBUG_HWDEVICE
       cryptonote::account_public_address pubkey;
@@ -547,17 +668,21 @@ namespace hw {
     }
 
     bool device_ledger::connected(void) const {
-      return hw_device.connected();
+      return transport_connected();
     }
 
     bool device_ledger::disconnect() {
-      hw_device.disconnect();
+      transport_disconnect();
       return true;
     }
 
     bool device_ledger::release() {
       this->disconnect();
-      hw_device.release();
+      if (!wants_ble_transport()) {
+      #if defined(HAVE_HIDAPI)
+        hw_device.release();
+      #endif
+      }
       return true;
     }
 
@@ -615,7 +740,17 @@ namespace hw {
         memset(vkey.data, 0x00, 32);
         memset(skey.data, 0xFF, 32);
 
+        // connect() has already completed this explicit device approval for
+        // the current Ledger session. account_base::create_from_device()
+        // calls us again immediately afterwards; requesting a second export
+        // would show the same confirmation twice without changing the keys.
+        if (this->has_view_key) {
+            MINFO("Ledger view-key export reused from the current device session");
+            return true;
+        }
+
         //spcialkey, normal conf handled in decrypt
+        MINFO("Ledger view-key export requested from device");
         send_simple(INS_GET_KEY, 0x02);
 
         //View key is retrievied, if allowed, to speed up blockchain parsing
@@ -2376,4 +2511,3 @@ namespace hw {
 
   }
 }
-

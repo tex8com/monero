@@ -14924,6 +14924,59 @@ std::pair<uint64_t, std::vector<std::pair<crypto::key_image, crypto::signature>>
   return std::make_pair(offset, ski);
 }
 
+std::vector<crypto::key_image> wallet2::owned_output_key_images() const
+{
+  std::vector<crypto::key_image> key_images;
+  key_images.reserve(m_transfers.size());
+  for (const transfer_details &td : m_transfers)
+  {
+    if (td.m_key_image_known && !td.m_key_image_partial)
+      key_images.push_back(td.m_key_image);
+  }
+  return key_images;
+}
+
+size_t wallet2::reconcile_output_key_images(
+    const std::vector<std::pair<crypto::key_image, bool>> &spent_states,
+    uint64_t checked_height)
+{
+  const uint64_t spent_height = std::max<uint64_t>(checked_height, 1);
+  size_t changed = 0;
+  std::unordered_set<crypto::key_image> seen;
+  seen.reserve(spent_states.size());
+
+  for (const auto &state : spent_states)
+  {
+    THROW_WALLET_EXCEPTION_IF(
+        !seen.insert(state.first).second,
+        error::wallet_internal_error,
+        "Duplicate key image in spent-state reconciliation");
+
+    const auto it = m_key_images.find(state.first);
+    THROW_WALLET_EXCEPTION_IF(
+        it == m_key_images.end(),
+        error::wallet_internal_error,
+        "Spent-state reconciliation contains a key image not owned by this wallet");
+
+    transfer_details &td = m_transfers[it->second];
+    if (!td.m_key_image_known || td.m_key_image_partial)
+      continue;
+
+    if (state.second && !td.m_spent)
+    {
+      set_spent(it->second, spent_height);
+      ++changed;
+    }
+    else if (!state.second && td.m_spent)
+    {
+      set_unspent(it->second);
+      ++changed;
+    }
+  }
+
+  return changed;
+}
+
 uint64_t wallet2::import_key_images(const std::string &filename, uint64_t &spent, uint64_t &unspent)
 {
   PERF_TIMER(import_key_images_fsu);

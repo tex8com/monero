@@ -34,7 +34,9 @@
 #include <string>
 #include "device.hpp"
 #include "log.hpp"
+#if defined(HAVE_HIDAPI)
 #include "device_io_hid.hpp"
+#endif
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/recursive_mutex.hpp>
 
@@ -57,6 +59,23 @@ namespace hw {
     void register_all(std::map<std::string, std::unique_ptr<device>> &registry);
 
     #ifdef WITH_DEVICE_LEDGER
+
+    struct ble_transport_callbacks {
+        void *context = nullptr;
+        bool (*connect)(void *context) = nullptr;
+        void (*disconnect)(void *context) = nullptr;
+        bool (*connected)(void *context) = nullptr;
+        int (*exchange)(void *context,
+                        const unsigned char *command,
+                        unsigned int command_length,
+                        unsigned char *response,
+                        unsigned int response_capacity,
+                        bool user_input) = nullptr;
+    };
+
+    void set_ble_transport_callbacks(const ble_transport_callbacks &callbacks);
+    void clear_ble_transport_callbacks();
+    bool ble_transport_available();
 
     // Origin: https://github.com/LedgerHQ/ledger-app-monero/blob/master/src/monero_types.h
     #define SW_OK                                   0x9000
@@ -148,7 +167,9 @@ namespace hw {
         mutable boost::mutex   command_locker;
 
         //IO
+#if defined(HAVE_HIDAPI)
         hw::io::device_io_hid hw_device;
+#endif
         unsigned int  length_send;
         unsigned char buffer_send[BUFFER_SEND_SIZE];
         unsigned int  length_recv;
@@ -159,6 +180,11 @@ namespace hw {
         void logRESP(void);
         unsigned int exchange(unsigned int ok=SW_OK, unsigned int mask=0xFFFF);
         unsigned int exchange_wait_on_input(unsigned int ok=SW_OK, unsigned int mask=0xFFFF);
+        bool wants_ble_transport() const;
+        bool transport_connect();
+        void transport_disconnect();
+        bool transport_connected() const;
+        unsigned int transport_exchange(bool user_input);
         void reset_buffer(void);
         int  set_command_header(unsigned char ins, unsigned char p1 = 0x00, unsigned char p2 = 0x00);
         int  set_command_header_noopt(unsigned char ins, unsigned char p1 = 0x00, unsigned char p2 = 0x00);
@@ -222,6 +248,15 @@ namespace hw {
         /* ======================================================================= */
         bool  get_public_address(cryptonote::account_public_address &pubkey) override;
         bool  get_secret_keys(crypto::secret_key &viewkey , crypto::secret_key &spendkey) override;
+        // The account object deliberately receives a fake view key for a
+        // Ledger wallet. Expose the real key only after get_secret_keys()
+        // received a user-approved export from the device, so the wallet API
+        // can create an explicitly requested local read-only companion.
+        bool exported_view_key(crypto::secret_key &out) const {
+            if (!has_view_key) return false;
+            out = viewkey;
+            return true;
+        }
         bool  generate_chacha_key(const cryptonote::account_keys &keys, crypto::chacha_key &key, uint64_t kdf_rounds) override;
         void  display_address(const cryptonote::subaddress_index& index, const boost::optional<crypto::hash8> &payment_id) override;
 
@@ -302,4 +337,3 @@ namespace hw {
   }
 
 }
-

@@ -38,6 +38,7 @@
 #include "subaddress_account.h"
 #include "common_defines.h"
 #include "common/util.h"
+#include "device/device_ledger.hpp"
 
 #include "mnemonics/electrum-words.h"
 #include "mnemonics/english.h"
@@ -89,6 +90,34 @@ using namespace cryptonote;
   } while (0)
 
 namespace Monero {
+
+    void setLedgerBleTransportCallbacks(const LedgerBleTransportCallbacks &callbacks) {
+    #ifdef WITH_DEVICE_LEDGER
+        hw::ledger::ble_transport_callbacks native_callbacks;
+        native_callbacks.context = callbacks.context;
+        native_callbacks.connect = callbacks.connect;
+        native_callbacks.disconnect = callbacks.disconnect;
+        native_callbacks.connected = callbacks.connected;
+        native_callbacks.exchange = callbacks.exchange;
+        hw::ledger::set_ble_transport_callbacks(native_callbacks);
+    #else
+        (void)callbacks;
+    #endif
+    }
+
+    void clearLedgerBleTransportCallbacks() {
+    #ifdef WITH_DEVICE_LEDGER
+        hw::ledger::clear_ble_transport_callbacks();
+    #endif
+    }
+
+    bool ledgerBleTransportAvailable() {
+    #ifdef WITH_DEVICE_LEDGER
+        return hw::ledger::ble_transport_available();
+    #else
+        return false;
+    #endif
+    }
 
 namespace {
     // copy-pasted from simplewallet
@@ -924,6 +953,22 @@ std::string WalletImpl::secretViewKey() const
     return epee::string_tools::pod_to_hex(unwrap(unwrap(m_wallet->get_account().get_keys().m_view_secret_key)));
 }
 
+std::string WalletImpl::hardwarePrivateViewKey() const
+{
+#ifdef WITH_DEVICE_LEDGER
+    if (m_wallet->get_device_type() != hw::device::LEDGER)
+        return "";
+    const auto& device = static_cast<const hw::ledger::device_ledger&>(
+        m_wallet->get_account().get_device());
+    crypto::secret_key private_view_key;
+    if (!device.exported_view_key(private_view_key))
+        return "";
+    return epee::string_tools::pod_to_hex(unwrap(unwrap(private_view_key)));
+#else
+    return "";
+#endif
+}
+
 std::string WalletImpl::publicViewKey() const
 {
     return epee::string_tools::pod_to_hex(m_wallet->get_account().get_keys().m_account_address.m_view_public_key);
@@ -1288,6 +1333,60 @@ bool WalletImpl::importKeyImages(const string &filename)
   }
 
   return true;
+}
+
+std::vector<std::string> WalletImpl::ownedOutputKeyImages() const
+{
+  std::vector<std::string> result;
+  try
+  {
+    const auto key_images = m_wallet->owned_output_key_images();
+    result.reserve(key_images.size());
+    for (const auto &key_image : key_images)
+      result.push_back(epee::string_tools::pod_to_hex(key_image));
+  }
+  catch (const std::exception &e)
+  {
+    LOG_ERROR("Error listing owned output key images: " << e.what());
+    setStatusError(e.what());
+  }
+  return result;
+}
+
+size_t WalletImpl::reconcileOutputKeyImages(
+    const std::vector<std::string> &keyImages,
+    const std::vector<bool> &spentStates,
+    uint64_t checkedHeight)
+{
+  clearStatus();
+  if (keyImages.size() != spentStates.size())
+  {
+    setStatusError(tr("Key image and spent-state counts do not match"));
+    return 0;
+  }
+
+  try
+  {
+    std::vector<std::pair<crypto::key_image, bool>> states;
+    states.reserve(keyImages.size());
+    for (size_t i = 0; i < keyImages.size(); ++i)
+    {
+      crypto::key_image key_image;
+      if (!epee::string_tools::hex_to_pod(keyImages[i], key_image))
+      {
+        setStatusError(tr("Failed to parse key image"));
+        return 0;
+      }
+      states.emplace_back(key_image, spentStates[i]);
+    }
+    return m_wallet->reconcile_output_key_images(states, checkedHeight);
+  }
+  catch (const std::exception &e)
+  {
+    LOG_ERROR("Error reconciling output key images: " << e.what());
+    setStatusError(e.what());
+    return 0;
+  }
 }
 
 bool WalletImpl::exportOutputs(const string &filename, bool all)
