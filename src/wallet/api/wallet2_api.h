@@ -49,6 +49,23 @@ enum NetworkType : uint8_t {
     STAGENET
 };
 
+struct LedgerBleTransportCallbacks {
+    void *context = nullptr;
+    bool (*connect)(void *context) = nullptr;
+    void (*disconnect)(void *context) = nullptr;
+    bool (*connected)(void *context) = nullptr;
+    int (*exchange)(void *context,
+                    const unsigned char *command,
+                    unsigned int command_length,
+                    unsigned char *response,
+                    unsigned int response_capacity,
+                    bool user_input) = nullptr;
+};
+
+void setLedgerBleTransportCallbacks(const LedgerBleTransportCallbacks &callbacks);
+void clearLedgerBleTransportCallbacks();
+bool ledgerBleTransportAvailable();
+
     namespace Utils {
         bool isAddressLocal(const std::string &hostaddr);
         void onStartup();
@@ -492,6 +509,12 @@ struct Wallet
     * \return                  - secret view key
     */
     virtual std::string secretViewKey() const = 0;
+    /*!
+     * \brief hardwarePrivateViewKey - returns a user-approved Ledger view key
+     * only after the hardware device has exported it. This method never
+     * exposes a spend key and returns an empty value for unsupported devices.
+     */
+    virtual std::string hardwarePrivateViewKey() const = 0;
 
    /*!
     * \brief publicViewKey     - returns public view key
@@ -932,6 +955,26 @@ struct Wallet
     * \return                  - true on success
     */
     virtual bool importKeyImages(const std::string &filename) = 0;
+
+    /**
+     * \brief ownedOutputKeyImages returns every locally known owned-output key
+     * image. The values are linkable spend metadata, not private keys, and are
+     * intended for explicit spent-status reconciliation only.
+     */
+    virtual std::vector<std::string> ownedOutputKeyImages() const = 0;
+
+    /**
+     * \brief reconcileOutputKeyImages applies authoritative spent/unspent
+     * states for locally owned outputs.
+     * \param keyImages 64-character hex key images owned by this wallet
+     * \param spentStates true for spent, false for unspent
+     * \param checkedHeight chain height at which the states were checked
+     * \return number of outputs whose local state changed
+     */
+    virtual size_t reconcileOutputKeyImages(
+        const std::vector<std::string> &keyImages,
+        const std::vector<bool> &spentStates,
+        uint64_t checkedHeight) = 0;
 
     /*!
      * \brief importOutputs - exports outputs to file

@@ -95,6 +95,7 @@ public:
     std::string address(uint32_t accountIndex = 0, uint32_t addressIndex = 0) const override;
     std::string integratedAddress(const std::string &payment_id) const override;
     std::string secretViewKey() const override;
+    std::string hardwarePrivateViewKey() const override;
     std::string publicViewKey() const override;
     std::string secretSpendKey() const override;
     std::string publicSpendKey() const override;
@@ -169,6 +170,11 @@ public:
     virtual UnsignedTransaction * loadUnsignedTx(const std::string &unsigned_filename) override;
     bool exportKeyImages(const std::string &filename, bool all = false) override;
     bool importKeyImages(const std::string &filename) override;
+    std::vector<std::string> ownedOutputKeyImages() const override;
+    size_t reconcileOutputKeyImages(
+        const std::vector<std::string> &keyImages,
+        const std::vector<bool> &spentStates,
+        uint64_t checkedHeight) override;
     bool exportOutputs(const std::string &filename, bool all = false) override;
     bool importOutputs(const std::string &filename) override;
     bool scanTransactions(const std::vector<std::string> &txids) override;
