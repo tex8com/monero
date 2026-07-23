@@ -49,7 +49,7 @@ namespace {
     constexpr int GRPC_HTTP2_BUFFER_BYTES = 64 * 1024 * 1024;
     constexpr int GRPC_HTTP2_MAX_FRAME_BYTES = 16 * 1024 * 1024 - 1;
 
-    size_t queue_capacity()
+    size_t default_queue_capacity()
     {
         static const size_t cap = []() -> size_t {
             const char *env = std::getenv("CUPRATE_GRPC_QUEUE_CAPACITY");
@@ -112,6 +112,7 @@ struct cuprate_grpc_stream_client::impl {
     uint64_t    total_blocks = 0;
     uint64_t    total_bytes = 0;
     uint64_t    backpressure_waits = 0;
+    size_t      queue_capacity = DEFAULT_QUEUE_CAPACITY;
 };
 
 cuprate_grpc_stream_client::cuprate_grpc_stream_client()
@@ -142,7 +143,7 @@ bool cuprate_grpc_stream_client::connect(const std::string& target)
     std::fprintf(stderr,
         "[GRPC client] CONNECT target=%s queue_capacity=%zu max_msg=%d http2_buffer=%d max_frame=%d (channel created -- gRPC connect is lazy, first RPC opens TCP)\n",
         target.c_str(),
-        queue_capacity(),
+        default_queue_capacity(),
         MAX_GRPC_MESSAGE_BYTES,
         GRPC_HTTP2_BUFFER_BYTES,
         GRPC_HTTP2_MAX_FRAME_BYTES);
@@ -154,7 +155,8 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
                                              bool prune,
                                              uint32_t chunk_blocks_hint,
                                              const std::string& client_request_id,
-                                             const std::vector<std::string>& chain_locator)
+                                             const std::vector<std::string>& chain_locator,
+                                             size_t queue_capacity_hint)
 {
     if (!p_->stub) {
         p_->last_error_code = -1;
@@ -179,6 +181,11 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
     p_->total_blocks = 0;
     p_->total_bytes = 0;
     p_->backpressure_waits = 0;
+    const size_t requested_queue_capacity = queue_capacity_hint > 0
+        ? queue_capacity_hint
+        : default_queue_capacity();
+    p_->queue_capacity = std::max<size_t>(1,
+        std::min(requested_queue_capacity, MAX_QUEUE_CAPACITY));
 
     cuprate::stream::v1::StreamBlocksRequest req;
     req.set_start_height(start_height);
@@ -194,12 +201,13 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
     p_->reader = p_->stub->StreamBlocks(p_->ctx.get(), req);
 
     std::fprintf(stderr,
-        "[GRPC client] OPEN client_req_id=%s start=%llu stop=%llu prune=%d chunk_hint=%u locator_hashes=%zu\n",
+        "[GRPC client] OPEN client_req_id=%s start=%llu stop=%llu prune=%d chunk_hint=%u queue_capacity=%zu locator_hashes=%zu\n",
         client_request_id.c_str(),
         (unsigned long long)start_height,
         (unsigned long long)stop_height,
         prune ? 1 : 0,
         chunk_blocks_hint,
+        p_->queue_capacity,
         chain_locator.size());
 
     p_->recv_thread = std::thread([this]() {
@@ -230,7 +238,7 @@ bool cuprate_grpc_stream_client::open_stream(uint64_t start_height,
             std::unique_lock<std::mutex> lk(p_->mu);
             const auto t_enq0 = std::chrono::steady_clock::now();
             p_->cv_not_full.wait(lk, [this]() {
-                return p_->queue.size() < queue_capacity() || p_->cancelled;
+                return p_->queue.size() < p_->queue_capacity || p_->cancelled;
             });
             const double enq_wait_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_enq0).count();

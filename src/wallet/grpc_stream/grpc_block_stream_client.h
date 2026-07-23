@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -57,13 +58,15 @@ public:
     //
     // `client_request_id` is echoed in the cuprated [GRPC StreamBlocks] log
     // line of every chunk — pass a per-sync-session id so wallet logs and
-    // server logs line up without a shared clock.
+    // server logs line up without a shared clock. `queue_capacity_hint` is a
+    // per-stream bound; zero keeps the CUPRATE_GRPC_QUEUE_CAPACITY setting.
     bool open_stream(uint64_t start_height,
                      uint64_t stop_height,
                      bool prune,
                      uint32_t chunk_blocks_hint,
                      const std::string& client_request_id,
-                     const std::vector<std::string>& chain_locator = {});
+                     const std::vector<std::string>& chain_locator = {},
+                     size_t queue_capacity_hint = 0);
 
     // Pop the next chunk's epee payload (blocking up to `timeout_ms`).
     // Returns false on timeout, end-of-stream, or error.

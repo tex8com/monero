@@ -3333,6 +3333,75 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
     const uint64_t effective_start = first && wallet_height > 0
       ? wallet_height - 1
       : std::max(start_height, wallet_height);
+    uint64_t stream_stop_height = 0;
+    uint32_t stream_chunk_hint = m_grpc_stream_chunk_hint;
+    size_t stream_queue_capacity = 0;
+
+    // A daemon that is behind this wallet cannot provide a forward stream.
+    // Its chain locator resolves to an old common block, after which the
+    // current client repeatedly opens and cancels gRPC before HTTP recovery.
+    // Keep recovery on the established bin-RPC path until the daemon catches
+    // up; do not permanently disable gRPC for subsequent refreshes.
+    uint64_t daemon_height = 0;
+    const boost::optional<std::string> height_error = m_node_rpc_proxy.get_height(daemon_height);
+    if (height_error)
+    {
+      MWARNING("grpc_stream: daemon height preflight failed: " << *height_error
+        << " -- retaining the existing unbounded stream plan");
+    }
+    else if (daemon_height <= wallet_height)
+    {
+      MWARNING("grpc_stream: daemon height=" << daemon_height
+        << " is not ahead of wallet height=" << wallet_height
+        << " -- using bin RPC recovery instead of an invalid gRPC forward stream");
+      return false;
+    }
+    else if (effective_start >= daemon_height)
+    {
+      MWARNING("grpc_stream: effective start=" << effective_start
+        << " is at or above daemon height=" << daemon_height
+        << " -- using bin RPC recovery instead of an invalid gRPC forward stream");
+      return false;
+    }
+    else
+    {
+      // A single ordered stream is intentional: HTTP/2 flow control already
+      // overlaps server serialisation, transfer and wallet scanning. Three
+      // buffered chunks keep that pipeline full without unbounded memory;
+      // independent parallel streams would add reordering/reorg complexity.
+      constexpr uint32_t minimum_chunk_hint = 16;
+      const uint32_t configured_chunk_hint = std::max<uint32_t>(minimum_chunk_hint,
+        std::min<uint32_t>(m_grpc_stream_chunk_hint, 10000));
+      const uint64_t blocks_to_tip = daemon_height - effective_start;
+      const uint64_t three_chunk_window = static_cast<uint64_t>(configured_chunk_hint) * 3;
+      const char* plan = "continuous";
+      stream_queue_capacity = 3;
+
+      if (blocks_to_tip <= configured_chunk_hint)
+      {
+        stream_chunk_hint = static_cast<uint32_t>(std::max<uint64_t>(
+          minimum_chunk_hint, blocks_to_tip));
+        stream_stop_height = daemon_height - 1;
+        stream_queue_capacity = 1;
+        plan = "one-chunk";
+      }
+      else if (blocks_to_tip <= three_chunk_window)
+      {
+        stream_chunk_hint = static_cast<uint32_t>(std::max<uint64_t>(
+          minimum_chunk_hint, (blocks_to_tip + 2) / 3));
+        stream_stop_height = daemon_height - 1;
+        plan = "three-chunk";
+      }
+
+      MWARNING("grpc_stream: adaptive plan=" << plan
+        << " wallet_height=" << wallet_height
+        << " daemon_height=" << daemon_height
+        << " blocks_to_tip=" << blocks_to_tip
+        << " start=" << effective_start
+        << " stop=" << stream_stop_height
+        << " chunk_hint=" << stream_chunk_hint
+        << " queue_capacity=" << stream_queue_capacity);
+    }
     if (!m_grpc_stream_client)
       m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
     m_grpc_stream_client->close();
@@ -3363,8 +3432,8 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
       chain_locator.emplace_back(
           reinterpret_cast<const char*>(&genesis_or_oldest), sizeof(genesis_or_oldest));
     }
-    if (!m_grpc_stream_client->open_stream(effective_start, /*stop=*/0, /*prune=*/true,
-        m_grpc_stream_chunk_hint, m_grpc_stream_session_id, chain_locator))
+    if (!m_grpc_stream_client->open_stream(effective_start, stream_stop_height, /*prune=*/true,
+        stream_chunk_hint, m_grpc_stream_session_id, chain_locator, stream_queue_capacity))
     {
       MWARNING("grpc_stream: open_stream failed at start=" << effective_start
         << " err=" << m_grpc_stream_client->last_error_message()
