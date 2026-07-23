@@ -1879,7 +1879,8 @@ private:
     // Try to satisfy a pull_blocks call via the cuprate gRPC stream instead
     // of bin RPC. Returns true on success (out params populated), false on
     // any error — caller should fall back to bin RPC for this iteration.
-    bool try_pull_blocks_grpc(bool first, uint64_t start_height, uint64_t &blocks_start_height,
+    bool try_pull_blocks_grpc(bool first, uint64_t start_height,
+        const std::list<crypto::hash> &short_chain_history, uint64_t &blocks_start_height,
         std::vector<cryptonote::block_complete_entry> &blocks,
         std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices,
         uint64_t &current_height);

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace cuprate_grpc_stream {
 
@@ -61,7 +62,8 @@ public:
                      uint64_t stop_height,
                      bool prune,
                      uint32_t chunk_blocks_hint,
-                     const std::string& client_request_id);
+                     const std::string& client_request_id,
+                     const std::vector<std::string>& chain_locator = {});
 
     // Pop the next chunk's epee payload (blocking up to `timeout_ms`).
     // Returns false on timeout, end-of-stream, or error.

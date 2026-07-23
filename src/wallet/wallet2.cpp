@@ -3302,7 +3302,8 @@ void wallet2::process_pool_info_extent(const cryptonote::COMMAND_RPC_GET_BLOCKS_
 }
 //----------------------------------------------------------------------------------------------------
 #ifdef MONERO_GRPC_STREAM
-bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height, uint64_t &blocks_start_height,
+bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
+    const std::list<crypto::hash> &short_chain_history, uint64_t &blocks_start_height,
     std::vector<cryptonote::block_complete_entry> &blocks,
     std::vector<cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::block_output_indices> &o_indices,
     uint64_t &current_height)
@@ -3347,8 +3348,23 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height, uint64_t &
     sid << "wallet-" << std::chrono::system_clock::now().time_since_epoch().count()
         << "-h" << effective_start;
     m_grpc_stream_session_id = sid.str();
+    std::vector<std::string> chain_locator;
+    chain_locator.reserve(std::min<size_t>(short_chain_history.size(), 256));
+    for (const crypto::hash& block_id : short_chain_history)
+    {
+      if (chain_locator.size() == 255)
+        break;
+      chain_locator.emplace_back(
+          reinterpret_cast<const char*>(&block_id), sizeof(block_id));
+    }
+    if (short_chain_history.size() > 255)
+    {
+      const crypto::hash& genesis_or_oldest = short_chain_history.back();
+      chain_locator.emplace_back(
+          reinterpret_cast<const char*>(&genesis_or_oldest), sizeof(genesis_or_oldest));
+    }
     if (!m_grpc_stream_client->open_stream(effective_start, /*stop=*/0, /*prune=*/true,
-        m_grpc_stream_chunk_hint, m_grpc_stream_session_id))
+        m_grpc_stream_chunk_hint, m_grpc_stream_session_id, chain_locator))
     {
       MWARNING("grpc_stream: open_stream failed at start=" << effective_start
         << " err=" << m_grpc_stream_client->last_error_message()
@@ -3468,7 +3484,8 @@ void wallet2::pull_blocks(bool first, bool try_incremental, uint64_t start_heigh
   if (!m_grpc_stream_endpoint.empty()
       && !m_grpc_stream_fallback_to_bin)
   {
-    if (try_pull_blocks_grpc(first, start_height, blocks_start_height, blocks, o_indices, current_height))
+    if (try_pull_blocks_grpc(first, start_height, short_chain_history,
+        blocks_start_height, blocks, o_indices, current_height))
     {
       if (first && !m_background_syncing)
       {

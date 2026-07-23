@@ -69,6 +69,11 @@ message StreamBlocksRequest {
   // PERF log entry on the server. Lets the wallet correlate its own log
   // lines with server logs without a shared clock. Keep <= 64 chars.
   string client_request_id = 6;
+
+  // Optional compact chain locator, newest hash first. Each entry is exactly
+  // 32 bytes. When supplied, the server finds the first common block and
+  // streams from that height, matching getblocks.bin reorg semantics.
+  repeated bytes chain_locator = 7;
 }
 
 message BlockChunk {

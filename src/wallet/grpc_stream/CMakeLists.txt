@@ -22,7 +22,15 @@ if(NOT DEFINED GRPC_CPP_PLUGIN_PATH)
     find_program(GRPC_CPP_PLUGIN_PATH grpc_cpp_plugin REQUIRED)
 endif()
 if(NOT DEFINED PROTOC_PATH)
-    find_program(PROTOC_PATH protoc REQUIRED)
+    # The Monero depends prefix supplies the protobuf headers linked by the
+    # wallet. Prefer its matching protoc when available: a newer system
+    # protoc can emit generated files which the pinned headers cannot compile.
+    if(DEFINED MONERO_DEPENDS_PREFIX AND
+       EXISTS "${MONERO_DEPENDS_PREFIX}/native/bin/protoc")
+        set(PROTOC_PATH "${MONERO_DEPENDS_PREFIX}/native/bin/protoc")
+    else()
+        find_program(PROTOC_PATH protoc REQUIRED)
+    endif()
 endif()
 
 set(PROTO_FILE  "${CMAKE_CURRENT_SOURCE_DIR}/cuprate_stream.proto")
