@@ -59,6 +59,7 @@ add_custom_command(
 
 add_library(cuprate_grpc_stream STATIC
     grpc_block_stream_client.cpp
+    grpc_block_range_pool.cpp
     ${GENERATED_PB}
 )
 

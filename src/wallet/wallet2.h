@@ -74,7 +74,7 @@
 #include "wallet_rpc_helpers.h"
 
 #ifdef MONERO_GRPC_STREAM
-#include "grpc_stream/grpc_block_stream_client.h"
+#include "grpc_stream/grpc_block_range_pool.h"
 #endif
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -2001,7 +2001,7 @@ private:
     const std::unique_ptr<epee::net_utils::http::abstract_http_client> m_http_client;
     std::vector<std::unique_ptr<epee::net_utils::http::abstract_http_client>> m_pull_clients;
 #ifdef MONERO_GRPC_STREAM
-    std::unique_ptr<cuprate_grpc_stream::cuprate_grpc_stream_client> m_grpc_stream_client;
+    std::unique_ptr<cuprate_grpc_stream::cuprate_grpc_block_range_pool> m_grpc_stream_client;
     std::string  m_grpc_stream_endpoint;
     std::string  m_grpc_stream_session_id;
     bool         m_grpc_stream_active = false;

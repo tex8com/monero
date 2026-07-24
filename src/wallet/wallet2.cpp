@@ -3335,7 +3335,7 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
       : std::max(start_height, wallet_height);
     uint64_t stream_stop_height = 0;
     uint32_t stream_chunk_hint = m_grpc_stream_chunk_hint;
-    size_t stream_queue_capacity = 0;
+    size_t stream_channels = 1;
 
     // A daemon that is behind this wallet cannot provide a forward stream.
     // Its chain locator resolves to an old common block, after which the
@@ -3347,7 +3347,8 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
     if (height_error)
     {
       MWARNING("grpc_stream: daemon height preflight failed: " << *height_error
-        << " -- retaining the existing unbounded stream plan");
+        << " -- using bin RPC because a bounded parallel range plan requires a tip");
+      return false;
     }
     else if (daemon_height <= wallet_height)
     {
@@ -3365,32 +3366,30 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
     }
     else
     {
-      // A single ordered stream is intentional: HTTP/2 flow control already
-      // overlaps server serialisation, transfer and wallet scanning. Three
-      // buffered chunks keep that pipeline full without unbounded memory;
-      // independent parallel streams would add reordering/reorg complexity.
+      // The range pool commits strictly in height order. It starts with one
+      // locator-validated range and then opens non-overlapping ranges on up to
+      // eight independent HTTP/2 connections. Each connection buffers at most
+      // one completed chunk, bounding reordering memory to eight chunks.
       constexpr uint32_t minimum_chunk_hint = 16;
       const uint32_t configured_chunk_hint = std::max<uint32_t>(minimum_chunk_hint,
-        std::min<uint32_t>(m_grpc_stream_chunk_hint, 10000));
+        std::min<uint32_t>(m_grpc_stream_chunk_hint, 512));
       const uint64_t blocks_to_tip = daemon_height - effective_start;
-      const uint64_t three_chunk_window = static_cast<uint64_t>(configured_chunk_hint) * 3;
-      const char* plan = "continuous";
-      stream_queue_capacity = 3;
+      const char* plan = "pool-1";
+      stream_stop_height = daemon_height - 1;
 
       if (blocks_to_tip <= configured_chunk_hint)
       {
         stream_chunk_hint = static_cast<uint32_t>(std::max<uint64_t>(
           minimum_chunk_hint, blocks_to_tip));
         stream_stop_height = daemon_height - 1;
-        stream_queue_capacity = 1;
         plan = "one-chunk";
       }
-      else if (blocks_to_tip <= three_chunk_window)
+      else
       {
-        stream_chunk_hint = static_cast<uint32_t>(std::max<uint64_t>(
-          minimum_chunk_hint, (blocks_to_tip + 2) / 3));
-        stream_stop_height = daemon_height - 1;
-        plan = "three-chunk";
+        while (stream_channels < 8
+          && blocks_to_tip > static_cast<uint64_t>(configured_chunk_hint) * stream_channels * 2)
+          stream_channels *= 2;
+        plan = stream_channels == 8 ? "pool-8" : stream_channels == 4 ? "pool-4" : stream_channels == 2 ? "pool-2" : "pool-1";
       }
 
       MWARNING("grpc_stream: adaptive plan=" << plan
@@ -3400,19 +3399,11 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
         << " start=" << effective_start
         << " stop=" << stream_stop_height
         << " chunk_hint=" << stream_chunk_hint
-        << " queue_capacity=" << stream_queue_capacity);
+        << " channels=" << stream_channels);
     }
     if (!m_grpc_stream_client)
-      m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
+      m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_block_range_pool>();
     m_grpc_stream_client->close();
-    if (!m_grpc_stream_client->connect(m_grpc_stream_endpoint))
-    {
-      MWARNING("grpc_stream: connect failed to '" << m_grpc_stream_endpoint
-        << "' err=" << m_grpc_stream_client->last_error_message()
-        << " -- falling back to bin RPC for this session");
-      m_grpc_stream_fallback_to_bin = true;
-      return false;
-    }
     std::ostringstream sid;
     sid << "wallet-" << std::chrono::system_clock::now().time_since_epoch().count()
         << "-h" << effective_start;
@@ -3432,8 +3423,8 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
       chain_locator.emplace_back(
           reinterpret_cast<const char*>(&genesis_or_oldest), sizeof(genesis_or_oldest));
     }
-    if (!m_grpc_stream_client->open_stream(effective_start, stream_stop_height, /*prune=*/true,
-        stream_chunk_hint, m_grpc_stream_session_id, chain_locator, stream_queue_capacity))
+    if (!m_grpc_stream_client->open(m_grpc_stream_endpoint, effective_start, stream_stop_height,
+        stream_chunk_hint, stream_channels, m_grpc_stream_session_id, chain_locator))
     {
       MWARNING("grpc_stream: open_stream failed at start=" << effective_start
         << " err=" << m_grpc_stream_client->last_error_message()
