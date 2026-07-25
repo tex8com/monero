@@ -63,6 +63,26 @@ size_t fast_generate_key_derivation_batch(
     const uint8_t *points,
     size_t count);
 
+/*
+ * Wallet scan batch with one shared view scalar.
+ *
+ * results:  output, count * 32 bytes
+ * scalar:   one 32-byte view scalar shared by all points
+ * points:   input, count * 32 bytes
+ * valid:    output, count bytes; 1 for a valid point, 0 otherwise
+ * workers:  fixed Rayon worker budget for this process (0 selects one worker)
+ *
+ * Returns the number of valid derivations. The per-item `valid` array is
+ * required so the C++ wallet preserves its scalar-path failure behaviour.
+ */
+size_t fast_generate_key_derivation_batch_same_scalar(
+    uint8_t *results,
+    const uint8_t *scalar,
+    const uint8_t *points,
+    uint8_t *valid,
+    size_t count,
+    size_t workers);
+
 #ifdef __cplusplus
 }
 #endif
