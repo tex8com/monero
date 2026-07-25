@@ -232,6 +232,14 @@ namespace crypto {
   inline bool generate_key_derivation(const public_key &key1, const secret_key &key2, key_derivation &derivation) {
     return crypto_ops::generate_key_derivation(key1, key2, derivation);
   }
+  /*
+   * Experimental software-wallet scan API. All points use the same view key.
+   * `valid[i]` mirrors the scalar API result for `points[i]`; invalid points
+   * therefore retain the caller's existing failure path.
+   */
+  size_t generate_key_derivation_batch_same_scalar(const secret_key &key2,
+    const public_key *points, key_derivation *derivations, uint8_t *valid,
+    size_t count, size_t workers);
   inline bool derive_public_key(const key_derivation &derivation, std::size_t output_index,
     const public_key &base, public_key &derived_key) {
     return crypto_ops::derive_public_key(derivation, output_index, base, derived_key);

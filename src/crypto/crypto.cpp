@@ -197,6 +197,17 @@ namespace crypto {
         reinterpret_cast<const uint8_t*>(&key1)) == 0;
   }
 
+  size_t generate_key_derivation_batch_same_scalar(const secret_key &key2,
+      const public_key *points, key_derivation *derivations, uint8_t *valid,
+      size_t count, size_t workers) {
+    if (count == 0)
+      return 0;
+    return fast_generate_key_derivation_batch_same_scalar(
+        reinterpret_cast<uint8_t*>(derivations),
+        reinterpret_cast<const uint8_t*>(&unwrap(key2)),
+        reinterpret_cast<const uint8_t*>(points), valid, count, workers);
+  }
+
   void crypto_ops::derivation_to_scalar(const key_derivation &derivation, size_t output_index, ec_scalar &res) {
     struct {
       key_derivation derivation;

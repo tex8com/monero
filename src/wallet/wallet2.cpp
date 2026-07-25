@@ -168,6 +168,27 @@ std::string tools::wallet2::default_daemon_address = "";
 
 namespace
 {
+  bool rust_derivation_batch_enabled()
+  {
+    const char* value = std::getenv("MONERO_RUST_DERIVATION_BATCH");
+    return value == nullptr || std::string(value) != "0";
+  }
+
+  unsigned rust_derivation_batch_workers(unsigned max_workers)
+  {
+    const unsigned fallback = (std::max)(1u, max_workers);
+    const char* value = std::getenv("MONERO_RUST_DERIVATION_WORKERS");
+    if (value == nullptr || *value == '\0')
+      return fallback;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0' || parsed == 0)
+      return fallback;
+    return static_cast<unsigned>((std::min)(
+      parsed, static_cast<unsigned long>(fallback)));
+  }
+
   std::string get_default_ringdb_path()
   {
     boost::filesystem::path dir = tools::get_default_data_dir();
@@ -3742,36 +3763,96 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
   hw::reset_mode rst(hwdev);
   hwdev.set_mode(hw::device::TRANSACTION_PARSE);
   const cryptonote::account_keys &keys = m_account.get_keys();
+  // Hardware devices own their key-derivation contract. The native Rust batch
+  // is enabled by default only for software wallets and may be disabled for
+  // reproducible A/B diagnostics with MONERO_RUST_DERIVATION_BATCH=0.
+  const bool use_rust_derivation_batch =
+    rust_derivation_batch_enabled() && hwdev.get_type() == hw::device::SOFTWARE;
+  const unsigned rust_batch_workers =
+    rust_derivation_batch_workers(tpool.get_max_concurrency());
   auto t_gender0 = std::chrono::steady_clock::now();
+
+  auto apply_derivation_failure = [](wallet2::is_out_data &iod) {
+    MWARNING("Failed to generate key derivation from tx pubkey, skipping");
+    static_assert(sizeof(iod.derivation) == sizeof(rct::key), "Mismatched sizes of key_derivation and rct::key");
+    memcpy(&iod.derivation, rct::identity().bytes, sizeof(iod.derivation));
+  };
 
   auto gender = [&](wallet2::is_out_data &iod) {
     if (!hwdev.generate_key_derivation(iod.pkey, keys.m_view_secret_key, iod.derivation))
-    {
-      MWARNING("Failed to generate key derivation from tx pubkey, skipping");
-      static_assert(sizeof(iod.derivation) == sizeof(rct::key), "Mismatched sizes of key_derivation and rct::key");
-      memcpy(&iod.derivation, rct::identity().bytes, sizeof(iod.derivation));
-    }
+      apply_derivation_failure(iod);
   };
 
   constexpr size_t DERIVATION_BATCH_SIZE = 100;
-  for (size_t batch_start = 0; batch_start < tx_cache_data.size(); batch_start += DERIVATION_BATCH_SIZE)
+  if (use_rust_derivation_batch)
   {
-    const size_t batch_end = std::min(batch_start + DERIVATION_BATCH_SIZE, tx_cache_data.size());
-    THROW_WALLET_EXCEPTION_IF(batch_end < batch_start, error::wallet_internal_error, "Derivation batch end overflow");
-    tpool.submit(&waiter, [&gender, &tx_cache_data, batch_start, batch_end]() {
-      for (size_t i = batch_start; i < batch_end; ++i)
+    size_t derivation_count = 0;
+    for (const auto &slot : tx_cache_data)
+      derivation_count += slot.primary.size() + slot.additional.size();
+
+    std::vector<wallet2::is_out_data*> derivation_items;
+    std::vector<crypto::public_key> derivation_points;
+    derivation_items.reserve(derivation_count);
+    derivation_points.reserve(derivation_count);
+    for (auto &slot : tx_cache_data)
+    {
+      for (auto &iod : slot.primary)
       {
-        auto &slot = tx_cache_data[i];
-        if (slot.empty())
-          continue;
-        for (auto &iod: slot.primary)
-          gender(iod);
-        for (auto &iod: slot.additional)
-          gender(iod);
+        derivation_items.push_back(&iod);
+        derivation_points.push_back(iod.pkey);
       }
-    }, true);
+      for (auto &iod : slot.additional)
+      {
+        derivation_items.push_back(&iod);
+        derivation_points.push_back(iod.pkey);
+      }
+    }
+    THROW_WALLET_EXCEPTION_IF(derivation_items.size() != derivation_count,
+      error::wallet_internal_error, "Derivation item count mismatch");
+
+    std::vector<crypto::key_derivation> derivation_results(derivation_count);
+    std::vector<uint8_t> derivation_valid(derivation_count, 0);
+    const size_t rust_successes = crypto::generate_key_derivation_batch_same_scalar(
+      keys.m_view_secret_key, derivation_points.data(), derivation_results.data(),
+      derivation_valid.data(), derivation_count, rust_batch_workers);
+
+    size_t valid_results = 0;
+    for (size_t i = 0; i < derivation_count; ++i)
+    {
+      if (derivation_valid[i] != 0)
+      {
+        derivation_items[i]->derivation = derivation_results[i];
+        ++valid_results;
+      }
+      else
+      {
+        apply_derivation_failure(*derivation_items[i]);
+      }
+    }
+    THROW_WALLET_EXCEPTION_IF(rust_successes != valid_results,
+      error::wallet_internal_error, "Rust derivation batch success count mismatch");
   }
-  THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  else
+  {
+    for (size_t batch_start = 0; batch_start < tx_cache_data.size(); batch_start += DERIVATION_BATCH_SIZE)
+    {
+      const size_t batch_end = std::min(batch_start + DERIVATION_BATCH_SIZE, tx_cache_data.size());
+      THROW_WALLET_EXCEPTION_IF(batch_end < batch_start, error::wallet_internal_error, "Derivation batch end overflow");
+      tpool.submit(&waiter, [&gender, &tx_cache_data, batch_start, batch_end]() {
+        for (size_t i = batch_start; i < batch_end; ++i)
+        {
+          auto &slot = tx_cache_data[i];
+          if (slot.empty())
+            continue;
+          for (auto &iod: slot.primary)
+            gender(iod);
+          for (auto &iod: slot.additional)
+            gender(iod);
+        }
+      }, true);
+    }
+    THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  }
   auto t_gender1 = std::chrono::steady_clock::now();
   MWARNING("PERF process_parsed_blocks: generate_key_derivation phase in "
     << std::chrono::duration_cast<std::chrono::milliseconds>(t_gender1 - t_gender0).count() << "ms");
