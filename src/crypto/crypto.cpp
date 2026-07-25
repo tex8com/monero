@@ -30,10 +30,12 @@
 
 #include <unistd.h>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/lock_guard.hpp>
 #include <boost/shared_ptr.hpp>
@@ -43,6 +45,9 @@
 #include "crypto.h"
 #include "hash.h"
 #include "monero_fast_crypto.h"
+#ifdef MONERO_FAST_METAL
+#include "monero_fast_metal.h"
+#endif
 
 #include "cryptonote_config.h"
 
@@ -56,6 +61,32 @@ namespace {
     abort();
 #endif
   }
+
+#ifdef MONERO_FAST_METAL
+  bool metal_derivation_batch_enabled(size_t count)
+  {
+    const char *enabled = std::getenv("MONERO_METAL_DERIVATION_BATCH");
+    if (enabled != nullptr && std::strcmp(enabled, "0") == 0)
+      return false;
+
+    // The precompiled product backend was measured against the exact packaged
+    // Rust C ABI on Apple M4. Metal is slower at 1,024 records, but already
+    // 1.38x faster at 2,048 and scales further from there.
+    constexpr size_t DEFAULT_MINIMUM = 2048;
+    size_t minimum = DEFAULT_MINIMUM;
+    const char *configured = std::getenv("MONERO_METAL_DERIVATION_MIN_POINTS");
+    if (configured != nullptr && *configured != '\0')
+    {
+      errno = 0;
+      char *end = nullptr;
+      const unsigned long long parsed = std::strtoull(configured, &end, 10);
+      if (errno == 0 && end != nullptr && *end == '\0'
+          && parsed <= std::numeric_limits<size_t>::max())
+        minimum = static_cast<size_t>(parsed);
+    }
+    return count >= minimum;
+  }
+#endif
 }
 
 namespace crypto {
@@ -202,6 +233,20 @@ namespace crypto {
       size_t count, size_t workers) {
     if (count == 0)
       return 0;
+#ifdef MONERO_FAST_METAL
+    if (metal_derivation_batch_enabled(count))
+    {
+      const int64_t metal_successes =
+        fast_metal_generate_key_derivation_batch_same_scalar(
+          reinterpret_cast<uint8_t*>(derivations),
+          reinterpret_cast<const uint8_t*>(&unwrap(key2)),
+          reinterpret_cast<const uint8_t*>(points),
+          valid,
+          count);
+      if (metal_successes >= 0)
+        return static_cast<size_t>(metal_successes);
+    }
+#endif
     return fast_generate_key_derivation_batch_same_scalar(
         reinterpret_cast<uint8_t*>(derivations),
         reinterpret_cast<const uint8_t*>(&unwrap(key2)),

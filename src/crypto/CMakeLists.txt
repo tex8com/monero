@@ -50,6 +50,16 @@ set(crypto_sources
   CryptonightR_JIT.c
   tree-hash.c)
 
+if(APPLE AND NOT IOS)
+  enable_language(OBJCXX)
+  set(MONERO_FAST_METAL_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../external/monero-fast-metal/src/monero_fast_metal.mm")
+  list(APPEND crypto_sources "${MONERO_FAST_METAL_SOURCE}")
+  set_source_files_properties(
+    "${MONERO_FAST_METAL_SOURCE}"
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
 if(ARCH_ID STREQUAL "i386" OR ARCH_ID STREQUAL "x86_64" OR ARCH_ID STREQUAL "x86-64" OR ARCH_ID STREQUAL "amd64")
 list(APPEND crypto_sources CryptonightR_template.S)
 endif()
@@ -71,6 +81,11 @@ set(
 include_directories(
   ${RANDOMX_INCLUDE}
   "${MONERO_FAST_CRYPTO_INCLUDE_DIR}")
+
+if(APPLE AND NOT IOS)
+  include_directories(
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../external/monero-fast-metal/include")
+endif()
 
 set(crypto_headers)
 
@@ -94,6 +109,11 @@ target_link_libraries(cncrypto
     ${MONERO_FAST_CRYPTO_LIBRARY}
   PRIVATE
     ${EXTRA_LIBRARIES})
+
+if(APPLE AND NOT IOS)
+  target_compile_definitions(cncrypto PRIVATE MONERO_FAST_METAL=1)
+  target_link_libraries(cncrypto PRIVATE "-framework Foundation" "-framework Metal")
+endif()
 
 if (ARM)
   option(NO_OPTIMIZED_MULTIPLY_ON_ARM
