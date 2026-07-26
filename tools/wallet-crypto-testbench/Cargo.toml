@@ -1,0 +1,18 @@
+[package]
+name = "monero-wallet-crypto-testbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This is deliberately a standalone harness.  It imports the product's
+# lib.rs by path below, so the wallet adapter is benchmarked as compiled code,
+# not as a reimplementation of it.
+
+[dependencies]
+curve25519-dalek = { version = "4.1.3", features = ["alloc"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

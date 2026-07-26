@@ -29,8 +29,11 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <numeric>
@@ -168,6 +171,57 @@ std::string tools::wallet2::default_daemon_address = "";
 
 namespace
 {
+  bool sync_trace_enabled()
+  {
+    static const bool enabled = [] {
+      const char* value = std::getenv("MONERO_SYNC_TRACE");
+      return value != nullptr && std::string(value) == "1";
+    }();
+    return enabled;
+  }
+
+  bool sync_profile_enabled()
+  {
+    static const bool enabled = [] {
+      const char* value = std::getenv("MONERO_SYNC_PROFILE");
+      return value != nullptr && std::string(value) == "1";
+    }();
+    return enabled;
+  }
+
+  bool rust_derivation_batch_requested()
+  {
+    const char* value = std::getenv("MONERO_RUST_DERIVATION_BATCH");
+    return value != nullptr && std::string(value) == "1";
+  }
+
+  unsigned rust_derivation_batch_workers(unsigned max_workers)
+  {
+    const unsigned fallback = (std::max)(1u, max_workers);
+    const char* value = std::getenv("MONERO_RUST_DERIVATION_WORKERS");
+    if (value == nullptr || *value == '\0')
+      return fallback;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0' || parsed == 0)
+      return fallback;
+    return static_cast<unsigned>((std::min)(parsed, static_cast<unsigned long>(fallback)));
+  }
+
+  void sync_trace(const char* format, ...)
+  {
+    if (!sync_trace_enabled())
+      return;
+    std::fputs("SYNC_TRACE ", stderr);
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+  }
+
   std::string get_default_ringdb_path()
   {
     boost::filesystem::path dir = tools::get_default_data_dir();
@@ -3302,6 +3356,24 @@ void wallet2::process_pool_info_extent(const cryptonote::COMMAND_RPC_GET_BLOCKS_
 }
 //----------------------------------------------------------------------------------------------------
 #ifdef MONERO_GRPC_STREAM
+namespace
+{
+bool grpc_range_pool_requested()
+{
+  // The range pool is deliberately opt-in.  The normal single gRPC stream is
+  // the product default and remains the only mobile profile until RAM/battery
+  // measurements exist for real iOS and Android devices.  Invalid values keep
+  // the safe one-stream path rather than silently enabling fan-out.
+  const char *env = std::getenv("CUPRATE_GRPC_RANGE_CONNECTIONS");
+  if (!env || !*env)
+    return false;
+  errno = 0;
+  char *endptr = nullptr;
+  const unsigned long parsed = std::strtoul(env, &endptr, 10);
+  return errno == 0 && endptr && *endptr == '\0' && parsed >= 2;
+}
+}
+
 bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
     const std::list<crypto::hash> &short_chain_history, uint64_t &blocks_start_height,
     std::vector<cryptonote::block_complete_entry> &blocks,
@@ -3334,7 +3406,19 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
       ? wallet_height - 1
       : std::max(start_height, wallet_height);
     if (!m_grpc_stream_client)
-      m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
+    {
+      if (grpc_range_pool_requested())
+      {
+        m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_range_pool>();
+        MWARNING("grpc_stream: experimental ordered range pool selected by "
+          "CUPRATE_GRPC_RANGE_CONNECTIONS; it is desktop benchmark-only, "
+          "with fixed range boundaries and bounded per-lane queues");
+      }
+      else
+      {
+        m_grpc_stream_client = std::make_unique<cuprate_grpc_stream::cuprate_grpc_stream_client>();
+      }
+    }
     m_grpc_stream_client->close();
     if (!m_grpc_stream_client->connect(m_grpc_stream_endpoint))
     {
@@ -3398,8 +3482,12 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
   // Decode the chunk's payload — it's exactly the wire format the bin RPC's
   // GetBlocks produces, so we can reuse the same deserializer.
   cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::response res = AUTO_VAL_INIT(res);
-  if (!epee::serialization::load_t_from_binary(res,
-        epee::strspan<uint8_t>(payload)))
+  const auto t_decode0 = std::chrono::steady_clock::now();
+  const bool decoded = epee::serialization::load_t_from_binary(
+      res, epee::strspan<uint8_t>(payload));
+  const auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t_decode0).count();
+  if (!decoded)
   {
     MWARNING("grpc_stream: payload deserialization failed ("
       << payload.size() << " bytes, seq=" << m_grpc_stream_client->last_chunk_seq()
@@ -3452,6 +3540,22 @@ bool wallet2::try_pull_blocks_grpc(bool first, uint64_t start_height,
   blocks = std::move(res.blocks);
   o_indices = std::move(res.output_indices);
   current_height = res.current_height;
+
+  sync_trace(
+      "stage=grpc_chunk start=%llu blocks=%zu payload_bytes=%zu pop_wait_ms=%.3f decode_ms=%lld read_call_ms=%.3f queue_dwell_ms=%.3f queue_chunks=%zu queue_bytes=%zu queue_highwater_chunks=%zu queue_highwater_bytes=%zu queue_full_wait_ms=%.3f read_wait_ms=%.3f",
+      static_cast<unsigned long long>(blocks_start_height),
+      blocks.size(),
+      payload.size(),
+      pop_wait_ms,
+      static_cast<long long>(decode_ms),
+      m_grpc_stream_client->last_chunk_read_call_ms(),
+      m_grpc_stream_client->last_chunk_queue_dwell_ms(),
+      m_grpc_stream_client->queue_depth(),
+      m_grpc_stream_client->queue_payload_bytes(),
+      m_grpc_stream_client->max_queue_depth(),
+      m_grpc_stream_client->max_queue_payload_bytes(),
+      m_grpc_stream_client->total_queue_full_wait_ms(),
+      m_grpc_stream_client->total_read_wait_ms());
 
   // Two-sided bottleneck signal:
   //   pop_wait_ms high  -> we blocked waiting for the next chunk => stream is
@@ -3618,17 +3722,22 @@ bool wallet2::pull_blocks_extra(
 //----------------------------------------------------------------------------------------------------
 // Fetch hashes by start_height only (empty block_ids), for parallel fast_refresh.
 // Requires the daemon to handle GetHashes with empty block_ids + start_height > 0.
-bool wallet2::pull_hashes_extra(epee::net_utils::http::abstract_http_client &client, uint64_t start_height, std::vector<crypto::hash> &hashes, uint64_t &resp_start_height)
+bool wallet2::pull_hashes_extra(epee::net_utils::http::abstract_http_client &client, uint64_t start_height, std::vector<crypto::hash> &hashes, uint64_t &resp_start_height, uint64_t &bytes_received)
 {
+  bytes_received = 0;
   cryptonote::COMMAND_RPC_GET_HASHES_FAST::request req = AUTO_VAL_INIT(req);
   cryptonote::COMMAND_RPC_GET_HASHES_FAST::response res = AUTO_VAL_INIT(res);
   // block_ids intentionally empty — daemon must use start_height
   req.start_height = start_height;
 
+  const uint64_t bytes_before = client.get_bytes_received();
   auto t0 = std::chrono::steady_clock::now();
   bool r = net_utils::invoke_http_bin("/gethashes.bin", req, res, client, rpc_timeout);
   auto t1 = std::chrono::steady_clock::now();
   const auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+  const uint64_t bytes_after = client.get_bytes_received();
+  const uint64_t bytes_rx = bytes_after >= bytes_before ? bytes_after - bytes_before : 0;
+  bytes_received = bytes_rx;
 
   if (!r || res.status != CORE_RPC_STATUS_OK || res.m_block_ids.empty())
   {
@@ -3641,7 +3750,12 @@ bool wallet2::pull_hashes_extra(epee::net_utils::http::abstract_http_client &cli
   MWARNING("PERF pull_hashes_extra OK h=" << start_height
     << " http_ms=" << http_ms
     << " hashes=" << res.m_block_ids.size()
-    << " resp_start_h=" << res.start_height);
+    << " resp_start_h=" << res.start_height
+    << " bytes_rx=" << bytes_rx);
+  sync_trace("stage=http_gethashes_parallel request_start=%llu response_start=%llu hashes=%zu http_ms=%lld bytes_rx=%llu",
+    static_cast<unsigned long long>(start_height),
+    static_cast<unsigned long long>(res.start_height), res.m_block_ids.size(),
+    static_cast<long long>(http_ms), static_cast<unsigned long long>(bytes_rx));
 
   hashes = std::move(res.m_block_ids);
   resp_start_height = res.start_height;
@@ -3660,16 +3774,24 @@ void wallet2::pull_hashes(uint64_t start_height, uint64_t &blocks_start_height, 
     const boost::lock_guard<boost::recursive_mutex> lock{m_daemon_rpc_mutex};
     req.client = get_client_signature();
     uint64_t pre_call_credits = m_rpc_payment_state.credits;
+    const uint64_t bytes_before = m_http_client->get_bytes_received();
     auto t0 = std::chrono::steady_clock::now();
     bool r = net_utils::invoke_http_bin("/gethashes.bin", req, res, *m_http_client, rpc_timeout);
     auto t1 = std::chrono::steady_clock::now();
     const auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    const uint64_t bytes_after = m_http_client->get_bytes_received();
+    const uint64_t bytes_rx = bytes_after >= bytes_before ? bytes_after - bytes_before : 0;
     MWARNING("PERF pull_hashes http_ms=" << http_ms
       << " req_history=" << short_chain_history.size()
       << " req_start_h=" << start_height
       << " resp_hashes=" << res.m_block_ids.size()
       << " resp_start_h=" << res.start_height
-      << " r=" << r);
+      << " r=" << r
+      << " bytes_rx=" << bytes_rx);
+    sync_trace("stage=http_gethashes request_start=%llu response_start=%llu hashes=%zu http_ms=%lld bytes_rx=%llu",
+      static_cast<unsigned long long>(start_height),
+      static_cast<unsigned long long>(res.start_height), res.m_block_ids.size(),
+      static_cast<long long>(http_ms), static_cast<unsigned long long>(bytes_rx));
     THROW_ON_RPC_RESPONSE_ERROR(r, {}, res, "gethashes.bin", error::get_hashes_error, get_rpc_status(res.status));
     check_rpc_cost("/gethashes.bin", res.credits, pre_call_credits, 1 + res.m_block_ids.size() * COST_PER_BLOCK_HASH);
   }
@@ -3737,44 +3859,196 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
   auto t_hash1 = std::chrono::steady_clock::now();
   MWARNING("PERF process_parsed_blocks: cache_tx_data(hash) " << num_txes << " txs in "
     << std::chrono::duration_cast<std::chrono::milliseconds>(t_hash1 - t_hash0).count() << "ms");
+  sync_trace("stage=scan_cache blocks=%zu txs=%zu outputs=%zu ms=%lld",
+    blocks.size(), num_txes, num_outputs,
+    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_hash1 - t_hash0).count()));
 
   hw::device &hwdev =  m_account.get_device();
   hw::reset_mode rst(hwdev);
   hwdev.set_mode(hw::device::TRANSACTION_PARSE);
   const cryptonote::account_keys &keys = m_account.get_keys();
+  const bool profile_key_derivation = sync_profile_enabled();
+  // This is deliberately opt-in and software-wallet-only. Hardware devices
+  // define their own derivation and key-handling contracts and must retain the
+  // virtual hw::device path below.
+  const bool use_rust_derivation_batch =
+    rust_derivation_batch_requested() && hwdev.get_type() == hw::device::SOFTWARE;
+  const unsigned rust_batch_workers =
+    rust_derivation_batch_workers(tpool.get_max_concurrency());
+  std::atomic<uint64_t> derivation_calls{0};
+  std::atomic<uint64_t> derivation_failures{0};
+  std::atomic<uint64_t> derivation_call_ns{0};
+  std::atomic<uint64_t> derivation_batch_ns{0};
+  std::atomic<size_t> derivation_active_batches{0};
+  std::atomic<size_t> derivation_peak_active_batches{0};
   auto t_gender0 = std::chrono::steady_clock::now();
 
+  auto apply_derivation_failure = [](wallet2::is_out_data &iod) {
+    MWARNING("Failed to generate key derivation from tx pubkey, skipping");
+    static_assert(sizeof(iod.derivation) == sizeof(rct::key), "Mismatched sizes of key_derivation and rct::key");
+    memcpy(&iod.derivation, rct::identity().bytes, sizeof(iod.derivation));
+  };
+
   auto gender = [&](wallet2::is_out_data &iod) {
-    if (!hwdev.generate_key_derivation(iod.pkey, keys.m_view_secret_key, iod.derivation))
+    const auto call_started = profile_key_derivation
+      ? std::chrono::steady_clock::now()
+      : t_gender0;
+    const bool generated = hwdev.generate_key_derivation(
+      iod.pkey, keys.m_view_secret_key, iod.derivation);
+    if (profile_key_derivation)
     {
-      MWARNING("Failed to generate key derivation from tx pubkey, skipping");
-      static_assert(sizeof(iod.derivation) == sizeof(rct::key), "Mismatched sizes of key_derivation and rct::key");
-      memcpy(&iod.derivation, rct::identity().bytes, sizeof(iod.derivation));
+      derivation_calls.fetch_add(1, std::memory_order_relaxed);
+      derivation_call_ns.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - call_started).count()),
+        std::memory_order_relaxed);
+      if (!generated)
+        derivation_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!generated)
+    {
+      apply_derivation_failure(iod);
     }
   };
 
   constexpr size_t DERIVATION_BATCH_SIZE = 100;
-  for (size_t batch_start = 0; batch_start < tx_cache_data.size(); batch_start += DERIVATION_BATCH_SIZE)
+  const size_t derivation_task_batches =
+    (tx_cache_data.size() + DERIVATION_BATCH_SIZE - 1) / DERIVATION_BATCH_SIZE;
+  if (use_rust_derivation_batch)
   {
-    const size_t batch_end = std::min(batch_start + DERIVATION_BATCH_SIZE, tx_cache_data.size());
-    THROW_WALLET_EXCEPTION_IF(batch_end < batch_start, error::wallet_internal_error, "Derivation batch end overflow");
-    tpool.submit(&waiter, [&gender, &tx_cache_data, batch_start, batch_end]() {
-      for (size_t i = batch_start; i < batch_end; ++i)
+    const auto gather_started = std::chrono::steady_clock::now();
+    size_t derivation_count = 0;
+    for (const auto &slot : tx_cache_data)
+      derivation_count += slot.primary.size() + slot.additional.size();
+
+    std::vector<wallet2::is_out_data*> derivation_items;
+    std::vector<crypto::public_key> derivation_points;
+    derivation_items.reserve(derivation_count);
+    derivation_points.reserve(derivation_count);
+    for (auto &slot : tx_cache_data)
+    {
+      for (auto &iod : slot.primary)
       {
-        auto &slot = tx_cache_data[i];
-        if (slot.empty())
-          continue;
-        for (auto &iod: slot.primary)
-          gender(iod);
-        for (auto &iod: slot.additional)
-          gender(iod);
+        derivation_items.push_back(&iod);
+        derivation_points.push_back(iod.pkey);
       }
-    }, true);
+      for (auto &iod : slot.additional)
+      {
+        derivation_items.push_back(&iod);
+        derivation_points.push_back(iod.pkey);
+      }
+    }
+    THROW_WALLET_EXCEPTION_IF(derivation_items.size() != derivation_count,
+      error::wallet_internal_error, "Derivation item count mismatch");
+    const auto gather_finished = std::chrono::steady_clock::now();
+
+    std::vector<crypto::key_derivation> derivation_results(derivation_count);
+    std::vector<uint8_t> derivation_valid(derivation_count, 0);
+    const auto rust_started = std::chrono::steady_clock::now();
+    const size_t rust_successes = crypto::generate_key_derivation_batch_same_scalar(
+      keys.m_view_secret_key, derivation_points.data(), derivation_results.data(),
+      derivation_valid.data(), derivation_count, rust_batch_workers);
+    const auto rust_finished = std::chrono::steady_clock::now();
+
+    const auto scatter_started = std::chrono::steady_clock::now();
+    size_t valid_results = 0;
+    size_t batch_failures = 0;
+    for (size_t i = 0; i < derivation_count; ++i)
+    {
+      if (derivation_valid[i] != 0)
+      {
+        derivation_items[i]->derivation = derivation_results[i];
+        ++valid_results;
+      }
+      else
+      {
+        ++batch_failures;
+        apply_derivation_failure(*derivation_items[i]);
+      }
+    }
+    const auto scatter_finished = std::chrono::steady_clock::now();
+    THROW_WALLET_EXCEPTION_IF(rust_successes != valid_results,
+      error::wallet_internal_error, "Rust derivation batch success count mismatch");
+    if (profile_key_derivation)
+    {
+      const auto to_ms = [](const std::chrono::steady_clock::time_point &end,
+          const std::chrono::steady_clock::time_point &start) {
+        return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+      };
+      sync_trace(
+        "stage=scan_key_derivation_batch_profile backend=rust_same_scalar_batch blocks=%zu txs=%zu workers=%u items=%zu api_calls=1 successes=%zu failures=%zu gather_ms=%.3f rust_ms=%.3f scatter_ms=%.3f",
+        blocks.size(), num_txes, rust_batch_workers, derivation_count, rust_successes,
+        batch_failures, to_ms(gather_finished, gather_started),
+        to_ms(rust_finished, rust_started), to_ms(scatter_finished, scatter_started));
+    }
   }
-  THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  else
+  {
+    for (size_t batch_start = 0; batch_start < tx_cache_data.size(); batch_start += DERIVATION_BATCH_SIZE)
+    {
+      const size_t batch_end = std::min(batch_start + DERIVATION_BATCH_SIZE, tx_cache_data.size());
+      THROW_WALLET_EXCEPTION_IF(batch_end < batch_start, error::wallet_internal_error, "Derivation batch end overflow");
+      tpool.submit(&waiter, [&gender, &tx_cache_data, batch_start, batch_end,
+        profile_key_derivation, &derivation_active_batches,
+        &derivation_peak_active_batches, &derivation_batch_ns]() {
+        const auto batch_started = profile_key_derivation
+          ? std::chrono::steady_clock::now()
+          : std::chrono::steady_clock::time_point{};
+        if (profile_key_derivation)
+        {
+          const size_t active = derivation_active_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+          size_t observed_peak = derivation_peak_active_batches.load(std::memory_order_relaxed);
+          while (active > observed_peak &&
+            !derivation_peak_active_batches.compare_exchange_weak(
+              observed_peak, active, std::memory_order_relaxed, std::memory_order_relaxed))
+          {}
+        }
+        for (size_t i = batch_start; i < batch_end; ++i)
+        {
+          auto &slot = tx_cache_data[i];
+          if (slot.empty())
+            continue;
+          for (auto &iod: slot.primary)
+            gender(iod);
+          for (auto &iod: slot.additional)
+            gender(iod);
+        }
+        if (profile_key_derivation)
+        {
+          derivation_batch_ns.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - batch_started).count()),
+            std::memory_order_relaxed);
+          derivation_active_batches.fetch_sub(1, std::memory_order_relaxed);
+        }
+      }, true);
+    }
+    THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+  }
   auto t_gender1 = std::chrono::steady_clock::now();
   MWARNING("PERF process_parsed_blocks: generate_key_derivation phase in "
     << std::chrono::duration_cast<std::chrono::milliseconds>(t_gender1 - t_gender0).count() << "ms");
+  sync_trace("stage=scan_key_derivation blocks=%zu txs=%zu ms=%lld",
+    blocks.size(), num_txes,
+    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_gender1 - t_gender0).count()));
+  if (profile_key_derivation && !use_rust_derivation_batch)
+  {
+    const uint64_t phase_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t_gender1 - t_gender0).count());
+    const uint64_t calls = derivation_calls.load(std::memory_order_relaxed);
+    const uint64_t call_ns = derivation_call_ns.load(std::memory_order_relaxed);
+    const uint64_t batch_ns = derivation_batch_ns.load(std::memory_order_relaxed);
+    sync_trace(
+      "stage=scan_key_derivation_profile blocks=%zu txs=%zu pool_max=%u task_batches=%zu peak_active_batches=%zu calls=%llu failures=%llu aggregate_call_ms=%.3f aggregate_batch_ms=%.3f effective_call_parallelism=%.3f effective_batch_parallelism=%.3f",
+      blocks.size(), num_txes, tpool.get_max_concurrency(), derivation_task_batches,
+      derivation_peak_active_batches.load(std::memory_order_relaxed),
+      static_cast<unsigned long long>(calls),
+      static_cast<unsigned long long>(derivation_failures.load(std::memory_order_relaxed)),
+      static_cast<double>(call_ns) / 1000000.0,
+      static_cast<double>(batch_ns) / 1000000.0,
+      phase_ns ? static_cast<double>(call_ns) / static_cast<double>(phase_ns) : 0.0,
+      phase_ns ? static_cast<double>(batch_ns) / static_cast<double>(phase_ns) : 0.0);
+  }
   auto t_geniod0 = std::chrono::steady_clock::now();
 
   auto geniod = [&](const cryptonote::transaction &tx, size_t n_vouts, size_t txidx) {
@@ -3869,6 +4143,9 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
   auto t_geniod1 = std::chrono::steady_clock::now();
   MWARNING("PERF process_parsed_blocks: geniod(scan outputs) " << num_outputs << " outputs in "
     << std::chrono::duration_cast<std::chrono::milliseconds>(t_geniod1 - t_geniod0).count() << "ms");
+  sync_trace("stage=scan_output_scan blocks=%zu outputs=%zu ms=%lld",
+    blocks.size(), num_outputs,
+    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_geniod1 - t_geniod0).count()));
 
   hwdev.set_mode(hw::device::NONE);
 
@@ -3941,6 +4218,13 @@ void wallet2::process_parsed_blocks(uint64_t start_height, const std::vector<cry
     << " blocks_added=" << blocks_added);
   MWARNING("PERF process_parsed_blocks TOTAL " << blocks.size() << " blocks, " << num_outputs << " outputs in "
     << std::chrono::duration_cast<std::chrono::milliseconds>(t_chain1 - t_proc0).count() << "ms");
+  sync_trace("stage=scan_chain_commit blocks=%zu blocks_added=%llu ms=%lld",
+    blocks.size(),
+    static_cast<unsigned long long>(blocks_added),
+    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_chain1 - t_chain0).count()));
+  sync_trace("stage=scan_total start=%llu blocks=%zu txs=%zu outputs=%zu ms=%lld",
+    static_cast<unsigned long long>(start_height), blocks.size(), num_txes, num_outputs,
+    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_chain1 - t_proc0).count()));
 }
 //----------------------------------------------------------------------------------------------------
 void wallet2::refresh(bool trusted_daemon)
@@ -4062,6 +4346,10 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
       << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(t1_pull - t0_pull).count() << "ms"
       << " | remaining=" << (current_height > blocks_start_height + blocks.size() ? current_height - blocks_start_height - blocks.size() : 0)
       << " | parallel_clients=" << m_pull_clients.size());
+    sync_trace("stage=pull blocks=%zu start=%llu total_ms=%lld transport=%s",
+      blocks.size(), static_cast<unsigned long long>(blocks_start_height),
+      static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t1_pull - t0_pull).count()),
+      grpc_stream_active_now ? "grpc" : "http_bin");
 
     // Wait for speculative prefetch and merge if alignment matches
     if (do_speculative)
@@ -4176,12 +4464,17 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
     tools::threadpool& tpool = tools::threadpool::getInstanceForCompute();
     tools::threadpool::waiter waiter(tpool);
     parsed_blocks.resize(blocks.size());
+    const auto t_parse_blocks0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < blocks.size(); ++i)
     {
       tpool.submit(&waiter, boost::bind(&wallet2::parse_block_round, this, std::cref(blocks[i].block),
         std::ref(parsed_blocks[i].block), std::ref(parsed_blocks[i].hash), std::ref(parsed_blocks[i].error)), true);
     }
     THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+    const auto t_parse_blocks1 = std::chrono::steady_clock::now();
+    sync_trace("stage=parse_blocks blocks=%zu ms=%lld",
+      blocks.size(),
+      static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_parse_blocks1 - t_parse_blocks0).count()));
     for (size_t i = 0; i < blocks.size(); ++i)
     {
       if (parsed_blocks[i].error)
@@ -4210,9 +4503,12 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
     }
 
     boost::mutex error_lock;
+    size_t tx_blobs_to_parse = 0;
+    const auto t_parse_txs0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < blocks.size(); ++i)
     {
       parsed_blocks[i].txes.resize(blocks[i].txs.size());
+      tx_blobs_to_parse += blocks[i].txs.size();
       for (size_t j = 0; j < blocks[i].txs.size(); ++j)
       {
         tpool.submit(&waiter, [&, i, j](){
@@ -4225,6 +4521,10 @@ void wallet2::pull_and_parse_next_blocks(bool first, bool try_incremental, uint6
       }
     }
     THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
+    const auto t_parse_txs1 = std::chrono::steady_clock::now();
+    sync_trace("stage=parse_txs blocks=%zu txs=%zu ms=%lld",
+      blocks.size(), tx_blobs_to_parse,
+      static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_parse_txs1 - t_parse_txs0).count()));
     last = !blocks.empty() && cryptonote::get_block_height(parsed_blocks.back().block) + 1 == current_height;
   }
   catch(...)
@@ -4718,6 +5018,7 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
         struct HashBatch {
           std::vector<crypto::hash> hashes;
           uint64_t resp_start_height = 0;
+          uint64_t bytes_received = 0;
           bool ok = false;
         };
         std::vector<HashBatch> batches(n_par);
@@ -4737,17 +5038,21 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
         {
           const uint64_t h = base_h + i * HASH_BATCH;
           threads.emplace_back([this, &batches, i, h]() {
-            batches[i].ok = pull_hashes_extra(*m_pull_clients[i], h, batches[i].hashes, batches[i].resp_start_height);
+            batches[i].ok = pull_hashes_extra(*m_pull_clients[i], h, batches[i].hashes, batches[i].resp_start_height, batches[i].bytes_received);
           });
         }
         for (auto& t : threads) t.join();
         auto t_pf1 = std::chrono::steady_clock::now();
 
         size_t pushed_this_round = 0;
+        size_t fetched_this_round = 0;
+        uint64_t bytes_this_round = 0;
         bool stopped = false;
         for (size_t i = 0; i < n_par; ++i)
         {
           if (!batches[i].ok) { stopped = true; break; }
+          fetched_this_round += batches[i].hashes.size();
+          bytes_this_round += batches[i].bytes_received;
           const uint64_t requested_h = base_h + i * HASH_BATCH;
           if (batches[i].resp_start_height != requested_h)
           {
@@ -4783,6 +5088,10 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
         MWARNING("PERF fast_refresh parallel: " << n_par << " clients pushed " << pushed_this_round
           << " hashes in " << std::chrono::duration_cast<std::chrono::milliseconds>(t_pf1 - t_pf0).count() << "ms"
           << " current_index=" << current_index << " stop=" << stop_height);
+        sync_trace("stage=http_gethashes_parallel_batch start=%llu clients=%zu fetched_hashes=%zu pushed_hashes=%zu bytes_rx=%llu wall_ms=%lld",
+          static_cast<unsigned long long>(base_h), n_par, fetched_this_round, pushed_this_round,
+          static_cast<unsigned long long>(bytes_this_round),
+          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_pf1 - t_pf0).count()));
 
         if (stopped || pushed_this_round == 0) break;
       }
@@ -5137,6 +5446,11 @@ void wallet2::refresh(bool trusted_daemon, uint64_t start_height, uint64_t & blo
         << " waiter_wait_ms=" << waiter_wait_ms
         << " bound=" << (waiter_wait_ms > proc_ms_for_log ? "NETWORK" : "SCAN")
         << " overlap_ratio=" << (proc_ms_for_log == 0 ? 0.0 : static_cast<double>(proc_ms_for_log) / (proc_ms_for_log + waiter_wait_ms)));
+      sync_trace("stage=pipeline iteration=%llu scan_ms=%lld fetch_wait_ms=%lld bound=%s",
+        static_cast<unsigned long long>(iter_count),
+        static_cast<long long>(proc_ms_for_log),
+        static_cast<long long>(waiter_wait_ms),
+        waiter_wait_ms > proc_ms_for_log ? "network" : "scan");
 
       // handle error from async fetching thread
       if (error)
